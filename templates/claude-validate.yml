@@ -1,0 +1,85 @@
+# GitHub Actions Workflow for Claude Code Bot Validation
+#
+# This workflow is triggered by the Jira-Claude bot to validate code changes
+# before creating a pull request. It ensures that code compiles and tests pass.
+#
+# Setup Instructions:
+# 1. Copy this file to your repository at: .github/workflows/claude-validate.yml
+# 2. Customize the node version, build command, and test command as needed
+# 3. The bot will automatically trigger this workflow when validating code changes
+
+name: Claude Code Validation
+
+on:
+  # Triggered manually by the Claude bot via GitHub API
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to validate'
+        required: true
+        type: string
+      test_type:
+        description: 'Type of validation to run'
+        required: true
+        type: choice
+        options:
+          - build
+          - test
+          - both
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'  # Adjust to match your project's Node version
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Build validation
+      - name: Run build
+        if: inputs.test_type == 'build' || inputs.test_type == 'both'
+        run: |
+          # Customize this command based on your project
+          # Common options:
+          # - npm run build
+          # - npm run build:prod
+          # - npx tsc --noEmit (TypeScript check without building)
+          # - npm run compile
+
+          npm run build
+
+      # Test validation
+      - name: Run tests
+        if: inputs.test_type == 'test' || inputs.test_type == 'both'
+        run: |
+          # Customize this command based on your project
+          # Common options:
+          # - npm test
+          # - npm run test:ci
+          # - npx jest
+          # - npx vitest run
+
+          npm test
+
+      # Optional: Lint check
+      # Uncomment if you want to include linting
+      # - name: Run linter
+      #   if: inputs.test_type == 'both'
+      #   run: npm run lint
+
+      # Optional: Type check (for TypeScript projects)
+      # Uncomment if you want separate type checking
+      # - name: Type check
+      #   if: inputs.test_type == 'build' || inputs.test_type == 'both'
+      #   run: npx tsc --noEmit
