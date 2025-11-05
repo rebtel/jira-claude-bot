@@ -161,6 +161,31 @@ vercel env ls
 3. **AI Code Review** - Reviewer agent analyzes changes
 4. **Revision Loop** - Fixes issues if needed
 5. **PR Creation** - Only after review passes
+6. **Browser Testing** - Visual validation on Vercel preview
+7. **Auto-Revision** - Claude fixes UI issues if found (one cycle)
+
+## 🖥️ Browser Testing & Visual Validation
+
+After a PR is created, the GitHub Actions workflow automatically:
+
+1. **Waits for Vercel Preview** - Grabs the live preview URL
+2. **Runs Playwright Tests** - Tests against actual deployment
+3. **Takes Screenshots** - Captures visual state of the app
+4. **AI Review** - Claude analyzes screenshots with:
+   - Original Jira ticket requirements
+   - PR description and intent
+   - Source code context
+5. **Auto-Revision (if needed)** - If visual issues detected:
+   - Claude pushes a fix commit to the same PR
+   - New Vercel deployment triggers
+   - Tests run once more
+   - Final review posted to PR
+
+**One revision cycle only** - Ensures quick feedback while preventing infinite loops.
+
+**Setup Required:**
+- Add `ANTHROPIC_API_KEY` to your GitHub repository secrets
+- Workflow runs automatically on all PRs to `main`
 
 ## Security Notes
 

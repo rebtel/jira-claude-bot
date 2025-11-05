@@ -6,13 +6,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  browser-test:
+  browser-test-and-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout code
+      - name: Checkout PR branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -23,67 +26,77 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Wait for Vercel Preview Deployment
+        uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
+        id: vercel-preview
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          max_timeout: 300
+          check_interval: 10
+
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
-      - name: Install Playwright
-        run: npm install -D @playwright/test
-
-      - name: Start application
+      - name: Run browser tests against Vercel preview
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
-          JIRA_WEBHOOK_SECRET: ${{ secrets.JIRA_WEBHOOK_SECRET }}
-        run: |
-          npm run dev &
-          echo $! > server.pid
-
-          # Wait for server to be ready
-          for i in {1..30}; do
-            if curl -s http://localhost:3000 > /dev/null; then
-              echo "Server is ready!"
-              break
-            fi
-            echo "Waiting for server... ($i/30)"
-            sleep 2
-          done
-
-      - name: Run browser tests
+          PLAYWRIGHT_BASE_URL: ${{ steps.vercel-preview.outputs.url }}
         run: npx playwright test
         continue-on-error: true
 
-      - name: Take screenshots
-        if: always()
+      - name: Take screenshots of preview deployment
+        env:
+          PREVIEW_URL: ${{ steps.vercel-preview.outputs.url }}
         run: |
-          npx playwright screenshot http://localhost:3000 screenshots/homepage.png || true
-          npx playwright screenshot http://localhost:3000/api/jira-webhook screenshots/api-endpoint.png || true
+          mkdir -p screenshots
+          npx playwright screenshot "$PREVIEW_URL" screenshots/homepage.png || true
+          npx playwright screenshot "$PREVIEW_URL/api/jira-webhook" screenshots/api-endpoint.png || true
 
-      - name: Stop application
-        if: always()
+      - name: Get PR and Jira context
+        id: pr-context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -f server.pid ]; then
-            kill $(cat server.pid) || true
+          # Get PR description
+          PR_BODY=$(gh pr view ${{ github.event.pull_request.number }} --json body --jq .body)
+          echo "PR_BODY<<EOF" >> $GITHUB_OUTPUT
+          echo "$PR_BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Extract Jira ticket key from PR body
+          JIRA_KEY=$(echo "$PR_BODY" | grep -oE '[A-Z]+-[0-9]+' | head -1 || echo "")
+          echo "jira_key=$JIRA_KEY" >> $GITHUB_OUTPUT
+
+          # Get list of changed files
+          CHANGED_FILES=$(gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' | tr '\n' ',' | sed 's/,$//')
+          echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+
+      - name: Check if revision already attempted
+        id: check-revision
+        run: |
+          # Check if this is already a revision commit
+          LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
+          if echo "$LAST_COMMIT_MSG" | grep -q "AI revision based on browser test review"; then
+            echo "is_revision=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_revision=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Upload test artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: browser-test-results
-          path: |
-            test-results/
-            screenshots/
-            playwright-report/
-          retention-days: 30
-
-      - name: AI Review Screenshots
-        if: always() && secrets.ANTHROPIC_API_KEY != ''
+      - name: AI Review and Revision
+        if: steps.check-revision.outputs.is_revision == 'false'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ steps.pr-context.outputs.PR_BODY }}
+          JIRA_KEY: ${{ steps.pr-context.outputs.jira_key }}
+          CHANGED_FILES: ${{ steps.pr-context.outputs.changed_files }}
+          PREVIEW_URL: ${{ steps.vercel-preview.outputs.url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
-          cat > review-screenshots.mjs << 'EOF'
+          cat > ai-review-and-revise.mjs << 'EOFSCRIPT'
           import Anthropic from "@anthropic-ai/sdk";
+          import { Octokit } from "@octokit/rest";
           import fs from "fs";
           import path from "path";
 
@@ -91,7 +104,11 @@ jobs:
             apiKey: process.env.ANTHROPIC_API_KEY
           });
 
-          async function reviewScreenshots() {
+          const octokit = new Octokit({
+            auth: process.env.GITHUB_TOKEN
+          });
+
+          async function reviewAndRevise() {
             const screenshotsDir = "screenshots";
             if (!fs.existsSync(screenshotsDir)) {
               console.log("No screenshots to review");
@@ -106,6 +123,7 @@ jobs:
               return;
             }
 
+            // Load screenshots
             const imageContents = images.map(img => {
               const imagePath = path.join(screenshotsDir, img);
               const imageData = fs.readFileSync(imagePath);
@@ -119,26 +137,52 @@ jobs:
               };
             });
 
-            console.log("Sending screenshots to Claude for review...");
+            // Get changed files content
+            const changedFiles = process.env.CHANGED_FILES.split(',').filter(f => f);
+            const fileContents = await Promise.all(
+              changedFiles.slice(0, 10).map(async (filepath) => {
+                try {
+                  const content = fs.readFileSync(filepath, 'utf8');
+                  return `## ${filepath}\n\`\`\`\n${content}\n\`\`\``;
+                } catch (err) {
+                  return `## ${filepath}\n(Could not read file)`;
+                }
+              })
+            );
+
+            console.log("Sending to Claude for review...");
+
+            const reviewPrompt = `You are reviewing a pull request for a web application deployed at ${process.env.PREVIEW_URL}.
+
+**Original Requirements (PR Description):**
+${process.env.PR_BODY}
+
+${process.env.JIRA_KEY ? `**Jira Ticket:** ${process.env.JIRA_KEY}` : ''}
+
+**Changed Files:**
+${fileContents.join('\n\n')}
+
+**Task:** Review the screenshots of the deployed preview and determine if the implementation matches the requirements.
+
+**Check for:**
+1. Does the visual result match what was described in the requirements?
+2. Are there any visual bugs, broken layouts, or errors visible?
+3. Are UI elements properly rendered and functional-looking?
+4. Does it look like the feature works as intended?
+
+**Response Format:**
+- If everything looks good: Respond with "APPROVED: [brief explanation]"
+- If there are issues: Respond with "NEEDS_REVISION: [detailed explanation of what's wrong and what needs to be fixed]"
+
+Be specific about what needs to change if revision is needed.`;
 
             const response = await client.messages.create({
               model: "claude-sonnet-4-20250514",
-              max_tokens: 2000,
+              max_tokens: 4000,
               messages: [{
                 role: "user",
                 content: [
-                  {
-                    type: "text",
-                    text: `Review these screenshots from the browser tests. Check for:
-
-1. Visual errors or broken layouts
-2. Missing UI elements
-3. Error messages displayed
-4. Unexpected behavior
-5. Overall functionality
-
-Provide a concise review with any issues found.`
-                  },
+                  { type: "text", text: reviewPrompt },
                   ...imageContents
                 ]
               }]
@@ -148,35 +192,194 @@ Provide a concise review with any issues found.`
             console.log("\n=== AI Review Results ===");
             console.log(review);
 
-            // Save review to file
-            fs.writeFileSync("ai-review.md", `# AI Screenshot Review\n\n${review}`);
+            // Save review
+            fs.writeFileSync("ai-review.md", `# AI Browser Test Review\n\n${review}\n\n**Preview URL:** ${process.env.PREVIEW_URL}`);
+
+            // Check if revision is needed
+            if (review.includes("NEEDS_REVISION")) {
+              console.log("\n🔄 Revision needed - triggering Claude to fix issues...");
+
+              const revisionPrompt = `You previously implemented this feature but the browser test review found issues.
+
+**Original Requirements:**
+${process.env.PR_BODY}
+
+**Your Previous Implementation:**
+${fileContents.join('\n\n')}
+
+**Review Feedback:**
+${review}
+
+**Task:** Fix the issues identified in the review. Make specific code changes to address the problems. Provide the complete updated code for each file that needs changes.
+
+Format your response as:
+FILE: path/to/file.ts
+\`\`\`typescript
+[complete updated code]
+\`\`\`
+
+FILE: path/to/another/file.ts
+\`\`\`typescript
+[complete updated code]
+\`\`\``;
+
+              const revisionResponse = await client.messages.create({
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 8000,
+                messages: [{
+                  role: "user",
+                  content: revisionPrompt
+                }]
+              });
+
+              const revisionContent = revisionResponse.content[0].text;
+              console.log("\n=== Revision Instructions ===");
+              console.log(revisionContent);
+
+              // Parse and apply changes
+              const filePattern = /FILE:\s*(.+?)\n```[\w]*\n([\s\S]+?)\n```/g;
+              let match;
+              const changes = [];
+
+              while ((match = filePattern.exec(revisionContent)) !== null) {
+                const filepath = match[1].trim();
+                const newContent = match[2];
+                changes.push({ filepath, newContent });
+              }
+
+              if (changes.length > 0) {
+                // Apply changes
+                for (const { filepath, newContent } of changes) {
+                  console.log(`✏️  Updating ${filepath}`);
+                  fs.writeFileSync(filepath, newContent);
+                }
+
+                // Commit and push
+                console.log("\n📝 Committing revision...");
+                const { execSync } = await import('child_process');
+
+                try {
+                  // Configure git
+                  execSync('git config user.name "github-actions[bot]"', { stdio: 'inherit' });
+                  execSync('git config user.email "github-actions[bot]@users.noreply.github.com"', { stdio: 'inherit' });
+
+                  // Stage files
+                  const filesToAdd = changes.map(c => c.filepath).join(' ');
+                  execSync(`git add ${filesToAdd}`, { stdio: 'inherit' });
+
+                  // Create commit message
+                  const commitMsg = "AI revision based on browser test review\n\n" +
+                    review.split('\n').slice(0, 5).join('\n') +
+                    "\n\n🤖 Generated with Claude Code";
+
+                  // Commit
+                  execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { stdio: 'inherit' });
+
+                  // Push
+                  execSync(`git push origin ${process.env.BRANCH}`, { stdio: 'inherit' });
+
+                  console.log("✅ Revision pushed!");
+                  fs.writeFileSync("revision-applied.txt", "true");
+                } catch (error) {
+                  console.error("Error pushing revision:", error);
+                }
+              } else {
+                console.log("⚠️  Could not parse revision changes from Claude's response");
+              }
+            } else {
+              console.log("✅ Review passed - no revision needed");
+            }
           }
 
-          reviewScreenshots().catch(console.error);
+          reviewAndRevise().catch(console.error);
+          EOFSCRIPT
+
+          node ai-review-and-revise.mjs
+
+      - name: Wait for revised Vercel deployment
+        if: hashFiles('revision-applied.txt') != ''
+        uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
+        id: vercel-preview-revised
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          max_timeout: 300
+          check_interval: 10
+
+      - name: Run tests again after revision
+        if: hashFiles('revision-applied.txt') != ''
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ steps.vercel-preview-revised.outputs.url }}
+        run: |
+          rm -rf screenshots test-results
+          mkdir -p screenshots
+          npx playwright test || true
+          npx playwright screenshot "${{ steps.vercel-preview-revised.outputs.url }}" screenshots/homepage-revised.png || true
+
+      - name: Final AI review after revision
+        if: always() && hashFiles('revision-applied.txt') != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PREVIEW_URL: ${{ steps.vercel-preview-revised.outputs.url }}
+        run: |
+          cat > final-review.mjs << 'EOF'
+          import Anthropic from "@anthropic-ai/sdk";
+          import fs from "fs";
+          import path from "path";
+
+          const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+          const screenshotsDir = "screenshots";
+          const files = fs.readdirSync(screenshotsDir).filter(f => f.endsWith(".png"));
+          const imageContents = files.map(img => ({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: fs.readFileSync(path.join(screenshotsDir, img)).toString("base64")
+            }
+          }));
+
+          const response = await client.messages.create({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 2000,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: "Review these screenshots after the revision. Briefly describe if the issues were fixed or if problems remain." },
+                ...imageContents
+              ]
+            }]
+          });
+
+          const finalReview = response.content[0].text;
+          fs.appendFileSync("ai-review.md", `\n\n## After Revision\n\n${finalReview}\n\n**Revised Preview URL:** ${process.env.PREVIEW_URL}`);
+          console.log(finalReview);
           EOF
 
-          node review-screenshots.mjs
+          node final-review.mjs
 
-      - name: Upload AI review
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-review
-          path: ai-review.md
+          name: browser-test-results
+          path: |
+            test-results/
+            screenshots/
+            playwright-report/
+            ai-review.md
           retention-days: 30
 
-      - name: Comment PR with AI review
-        if: always() && github.event_name == 'pull_request' && hashFiles('ai-review.md') != ''
+      - name: Comment PR with review
+        if: always() && hashFiles('ai-review.md') != ''
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            if (fs.existsSync('ai-review.md')) {
-              const review = fs.readFileSync('ai-review.md', 'utf8');
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: `## 🤖 AI Browser Test Review\n\n${review}\n\n---\n*View full test results in [workflow artifacts](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`
-              });
-            }
+            const review = fs.readFileSync('ai-review.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: review + `\n\n---\n*View full test results in [workflow artifacts](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`
+            });
