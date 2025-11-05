@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "deploy": "vercel --prod",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
@@ -12,6 +14,7 @@
     "@octokit/rest": "^22.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.47.0",
     "@types/node": "^20.0.0",
     "@vercel/node": "^3.0.0",
     "typescript": "^5.0.0"

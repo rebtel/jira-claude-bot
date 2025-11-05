@@ -1,0 +1,182 @@
+name: Browser Tests & AI Review
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  browser-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright
+        run: npm install -D @playwright/test
+
+      - name: Start application
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+          JIRA_WEBHOOK_SECRET: ${{ secrets.JIRA_WEBHOOK_SECRET }}
+        run: |
+          npm run dev &
+          echo $! > server.pid
+
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if curl -s http://localhost:3000 > /dev/null; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run browser tests
+        run: npx playwright test
+        continue-on-error: true
+
+      - name: Take screenshots
+        if: always()
+        run: |
+          npx playwright screenshot http://localhost:3000 screenshots/homepage.png || true
+          npx playwright screenshot http://localhost:3000/api/jira-webhook screenshots/api-endpoint.png || true
+
+      - name: Stop application
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) || true
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-test-results
+          path: |
+            test-results/
+            screenshots/
+            playwright-report/
+          retention-days: 30
+
+      - name: AI Review Screenshots
+        if: always() && secrets.ANTHROPIC_API_KEY != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cat > review-screenshots.mjs << 'EOF'
+          import Anthropic from "@anthropic-ai/sdk";
+          import fs from "fs";
+          import path from "path";
+
+          const client = new Anthropic({
+            apiKey: process.env.ANTHROPIC_API_KEY
+          });
+
+          async function reviewScreenshots() {
+            const screenshotsDir = "screenshots";
+            if (!fs.existsSync(screenshotsDir)) {
+              console.log("No screenshots to review");
+              return;
+            }
+
+            const files = fs.readdirSync(screenshotsDir);
+            const images = files.filter(f => f.endsWith(".png"));
+
+            if (images.length === 0) {
+              console.log("No PNG screenshots found");
+              return;
+            }
+
+            const imageContents = images.map(img => {
+              const imagePath = path.join(screenshotsDir, img);
+              const imageData = fs.readFileSync(imagePath);
+              return {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/png",
+                  data: imageData.toString("base64")
+                }
+              };
+            });
+
+            console.log("Sending screenshots to Claude for review...");
+
+            const response = await client.messages.create({
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 2000,
+              messages: [{
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: `Review these screenshots from the browser tests. Check for:
+
+1. Visual errors or broken layouts
+2. Missing UI elements
+3. Error messages displayed
+4. Unexpected behavior
+5. Overall functionality
+
+Provide a concise review with any issues found.`
+                  },
+                  ...imageContents
+                ]
+              }]
+            });
+
+            const review = response.content[0].text;
+            console.log("\n=== AI Review Results ===");
+            console.log(review);
+
+            // Save review to file
+            fs.writeFileSync("ai-review.md", `# AI Screenshot Review\n\n${review}`);
+          }
+
+          reviewScreenshots().catch(console.error);
+          EOF
+
+          node review-screenshots.mjs
+
+      - name: Upload AI review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review
+          path: ai-review.md
+          retention-days: 30
+
+      - name: Comment PR with AI review
+        if: always() && github.event_name == 'pull_request' && hashFiles('ai-review.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('ai-review.md')) {
+              const review = fs.readFileSync('ai-review.md', 'utf8');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## 🤖 AI Browser Test Review\n\n${review}\n\n---\n*View full test results in [workflow artifacts](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`
+              });
+            }
