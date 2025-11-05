@@ -143,38 +143,32 @@ jobs:
               changedFiles.slice(0, 10).map(async (filepath) => {
                 try {
                   const content = fs.readFileSync(filepath, 'utf8');
-                  return `## ${filepath}\n\`\`\`\n${content}\n\`\`\``;
+                  return "## " + filepath + "\\n\`\`\`\\n" + content + "\\n\`\`\`";
                 } catch (err) {
-                  return `## ${filepath}\n(Could not read file)`;
+                  return "## " + filepath + "\\n(Could not read file)";
                 }
               })
             );
 
             console.log("Sending to Claude for review...");
 
-            const reviewPrompt = `You are reviewing a pull request for a web application deployed at ${process.env.PREVIEW_URL}.
-
-**Original Requirements (PR Description):**
-${process.env.PR_BODY}
-
-${process.env.JIRA_KEY ? `**Jira Ticket:** ${process.env.JIRA_KEY}` : ''}
-
-**Changed Files:**
-${fileContents.join('\n\n')}
-
-**Task:** Review the screenshots of the deployed preview and determine if the implementation matches the requirements.
-
-**Check for:**
-1. Does the visual result match what was described in the requirements?
-2. Are there any visual bugs, broken layouts, or errors visible?
-3. Are UI elements properly rendered and functional-looking?
-4. Does it look like the feature works as intended?
-
-**Response Format:**
-- If everything looks good: Respond with "APPROVED: [brief explanation]"
-- If there are issues: Respond with "NEEDS_REVISION: [detailed explanation of what's wrong and what needs to be fixed]"
-
-Be specific about what needs to change if revision is needed.`;
+            const jiraSection = process.env.JIRA_KEY ? "**Jira Ticket:** " + process.env.JIRA_KEY : "";
+            const reviewPrompt = "You are reviewing a pull request for a web application deployed at " + process.env.PREVIEW_URL + ".\\n\\n" +
+              "**Original Requirements (PR Description):**\\n" +
+              process.env.PR_BODY + "\\n\\n" +
+              jiraSection + "\\n\\n" +
+              "**Changed Files:**\\n" +
+              fileContents.join("\\n\\n") + "\\n\\n" +
+              "**Task:** Review the screenshots of the deployed preview and determine if the implementation matches the requirements.\\n\\n" +
+              "**Check for:**\\n" +
+              "1. Does the visual result match what was described in the requirements?\\n" +
+              "2. Are there any visual bugs, broken layouts, or errors visible?\\n" +
+              "3. Are UI elements properly rendered and functional-looking?\\n" +
+              "4. Does it look like the feature works as intended?\\n\\n" +
+              "**Response Format:**\\n" +
+              "- If everything looks good: Respond with \\"APPROVED: [brief explanation]\\"\\n" +
+              "- If there are issues: Respond with \\"NEEDS_REVISION: [detailed explanation of what's wrong and what needs to be fixed]\\"\\n\\n" +
+              "Be specific about what needs to change if revision is needed.";
 
             const response = await client.messages.create({
               model: "claude-sonnet-4-20250514",
@@ -189,39 +183,33 @@ Be specific about what needs to change if revision is needed.`;
             });
 
             const review = response.content[0].text;
-            console.log("\n=== AI Review Results ===");
+            console.log("\\n=== AI Review Results ===");
             console.log(review);
 
             // Save review
-            fs.writeFileSync("ai-review.md", `# AI Browser Test Review\n\n${review}\n\n**Preview URL:** ${process.env.PREVIEW_URL}`);
+            fs.writeFileSync("ai-review.md", "# AI Browser Test Review\\n\\n" + review + "\\n\\n**Preview URL:** " + process.env.PREVIEW_URL);
 
             // Check if revision is needed
             if (review.includes("NEEDS_REVISION")) {
-              console.log("\n🔄 Revision needed - triggering Claude to fix issues...");
+              console.log("\\n🔄 Revision needed - triggering Claude to fix issues...");
 
-              const revisionPrompt = `You previously implemented this feature but the browser test review found issues.
-
-**Original Requirements:**
-${process.env.PR_BODY}
-
-**Your Previous Implementation:**
-${fileContents.join('\n\n')}
-
-**Review Feedback:**
-${review}
-
-**Task:** Fix the issues identified in the review. Make specific code changes to address the problems. Provide the complete updated code for each file that needs changes.
-
-Format your response as:
-FILE: path/to/file.ts
-\`\`\`typescript
-[complete updated code]
-\`\`\`
-
-FILE: path/to/another/file.ts
-\`\`\`typescript
-[complete updated code]
-\`\`\``;
+              const revisionPrompt = "You previously implemented this feature but the browser test review found issues.\\n\\n" +
+                "**Original Requirements:**\\n" +
+                process.env.PR_BODY + "\\n\\n" +
+                "**Your Previous Implementation:**\\n" +
+                fileContents.join("\\n\\n") + "\\n\\n" +
+                "**Review Feedback:**\\n" +
+                review + "\\n\\n" +
+                "**Task:** Fix the issues identified in the review. Make specific code changes to address the problems. Provide the complete updated code for each file that needs changes.\\n\\n" +
+                "Format your response as:\\n" +
+                "FILE: path/to/file.ts\\n" +
+                "\`\`\`typescript\\n" +
+                "[complete updated code]\\n" +
+                "\`\`\`\\n\\n" +
+                "FILE: path/to/another/file.ts\\n" +
+                "\`\`\`typescript\\n" +
+                "[complete updated code]\\n" +
+                "\`\`\`";
 
               const revisionResponse = await client.messages.create({
                 model: "claude-sonnet-4-20250514",
@@ -233,7 +221,7 @@ FILE: path/to/another/file.ts
               });
 
               const revisionContent = revisionResponse.content[0].text;
-              console.log("\n=== Revision Instructions ===");
+              console.log("\\n=== Revision Instructions ===");
               console.log(revisionContent);
 
               // Parse and apply changes
@@ -250,12 +238,12 @@ FILE: path/to/another/file.ts
               if (changes.length > 0) {
                 // Apply changes
                 for (const { filepath, newContent } of changes) {
-                  console.log(`✏️  Updating ${filepath}`);
+                  console.log("✏️  Updating " + filepath);
                   fs.writeFileSync(filepath, newContent);
                 }
 
                 // Commit and push
-                console.log("\n📝 Committing revision...");
+                console.log("\\n📝 Committing revision...");
                 const { execSync } = await import('child_process');
 
                 try {
@@ -265,18 +253,18 @@ FILE: path/to/another/file.ts
 
                   // Stage files
                   const filesToAdd = changes.map(c => c.filepath).join(' ');
-                  execSync(`git add ${filesToAdd}`, { stdio: 'inherit' });
+                  execSync("git add " + filesToAdd, { stdio: 'inherit' });
 
                   // Create commit message
-                  const commitMsg = "AI revision based on browser test review\n\n" +
-                    review.split('\n').slice(0, 5).join('\n') +
-                    "\n\n🤖 Generated with Claude Code";
+                  const commitMsg = "AI revision based on browser test review\\n\\n" +
+                    review.split("\\n").slice(0, 5).join("\\n") +
+                    "\\n\\n🤖 Generated with Claude Code";
 
                   // Commit
-                  execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { stdio: 'inherit' });
+                  execSync("git commit -m \\"" + commitMsg.replace(/"/g, '\\\\"') + "\\"", { stdio: 'inherit' });
 
                   // Push
-                  execSync(`git push origin ${process.env.BRANCH}`, { stdio: 'inherit' });
+                  execSync("git push origin " + process.env.BRANCH, { stdio: 'inherit' });
 
                   console.log("✅ Revision pushed!");
                   fs.writeFileSync("revision-applied.txt", "true");
@@ -352,7 +340,7 @@ FILE: path/to/another/file.ts
           });
 
           const finalReview = response.content[0].text;
-          fs.appendFileSync("ai-review.md", `\n\n## After Revision\n\n${finalReview}\n\n**Revised Preview URL:** ${process.env.PREVIEW_URL}`);
+          fs.appendFileSync("ai-review.md", "\\n\\n## After Revision\\n\\n" + finalReview + "\\n\\n**Revised Preview URL:** " + process.env.PREVIEW_URL);
           console.log(finalReview);
           EOF
 
@@ -377,9 +365,10 @@ FILE: path/to/another/file.ts
           script: |
             const fs = require('fs');
             const review = fs.readFileSync('ai-review.md', 'utf8');
+            const artifactsUrl = context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: review + `\n\n---\n*View full test results in [workflow artifacts](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`
+              body: review + '\n\n---\n*View full test results in [workflow artifacts](' + artifactsUrl + ')*'
             });
