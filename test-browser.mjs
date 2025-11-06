@@ -56,6 +56,11 @@ When NO phone number exists: no feedback/animation when clicking outside
 
 Phone number validation requirements unchanged
 
+Testing:
+Navigate to the path /en/recharge/mexico/products?msisdn=+526568621100
+Click the edit button next to the phone number
+validate ticket meets acceptance criteria
+
 
 
 repo: rebtel/rebtel-web
@@ -103,11 +108,22 @@ async function executeBrowserTest(previewUrl, testCode) {
     console.log(`📍 Navigating to ${previewUrl}...`);
     await page.goto(previewUrl, { waitUntil: 'networkidle' });
 
+    const actualUrl = page.url();
+    console.log(`✓ Page loaded, actual URL: ${actualUrl}`);
+    console.log(`✓ Origin extracted would be: ${new URL(actualUrl).origin}`);
+
     const initialScreenshot = await page.screenshot({ fullPage: false });
     steps.push({
       description: 'Initial page load',
       screenshot: initialScreenshot.toString('base64')
     });
+
+    // Wrap page.goto to log navigation attempts
+    const originalGoto = page.goto.bind(page);
+    page.goto = async (url, options) => {
+      console.log(`🔗 Test navigating to: ${url}`);
+      return originalGoto(url, options);
+    };
 
     const testHelpers = {
       page,
@@ -121,7 +137,8 @@ async function executeBrowserTest(previewUrl, testCode) {
       }
     };
 
-    const testFunction = new Function('helpers', testCode);
+    const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    const testFunction = new AsyncFunction('helpers', testCode);
     await testFunction(testHelpers);
 
     console.log(`✅ Test executed successfully with ${steps.length} steps captured`);
@@ -155,25 +172,35 @@ ${JIRA_DESCRIPTION}
 **Preview URL:** ${PREVIEW_URL}
 The browser will start at the preview URL (homepage). This is a web application.
 
-**IMPORTANT - Routing:**
-- The page is already loaded at the preview URL
-- DO NOT use relative paths like '/products' - the site may have locale/region routing
-- Navigate using visible UI elements (buttons, links, navigation) when possible
-- If you must navigate to a URL, inspect the actual site structure first by waiting for page load
-- For example, if the site uses /<lang>/<region>/<page> structure, use full URLs or click navigation links
+**CRITICAL - Path Handling:**
+- The page is already loaded at ${PREVIEW_URL} (may auto-redirect to include locale like /en/)
+- If requirements mention a path like "/en/recharge/mexico/products", you MUST construct the URL correctly
+- Get the page's origin (domain only): const origin = new URL(helpers.page.url()).origin;
+- Then navigate: await helpers.page.goto(origin + '/en/recharge/mexico/products');
+- This prevents doubling locale paths (e.g., /en/en/recharge...)
+
+**Navigation Strategy:**
+1. For specific paths in requirements:
+   - const origin = new URL(helpers.page.url()).origin;
+   - await helpers.page.goto(origin + '/the/path/from/requirements');
+2. For UI navigation, click links/buttons on the page
+3. NEVER use relative paths or assume URL structure
 
 **What to test:**
 - Test the specific functionality described in the requirements
 - Capture screenshots at key steps to visually verify behavior
 - Use reliable selectors (data-testid, aria-labels, or specific classes)
+- Wait for elements to be ready before interacting
 
 Provide ONLY the JavaScript code to execute (no markdown, no explanations). The code will be run with:
 - helpers.page (Playwright Page object) - already at ${PREVIEW_URL}
 - helpers.captureStep(description) (captures screenshot with description)
 
-Example for testing a modal:
-await helpers.captureStep('Page loaded');
-await helpers.page.click('[data-testid="open-modal-button"]');
+Example for testing navigation and modal:
+const origin = new URL(helpers.page.url()).origin;
+await helpers.page.goto(origin + '/en/recharge/mexico/products?msisdn=+123456');
+await helpers.captureStep('Page loaded at products');
+await helpers.page.click('[data-testid="edit-button"]');
 await helpers.page.waitForTimeout(500);
 await helpers.captureStep('Modal opened');
 

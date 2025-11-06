@@ -641,58 +641,202 @@ async function processIssueAsync(
             `🔍 **Starting Browser Tests**\n\nVercel preview deployed at: ${previewUrl}\n\nRunning automated visual verification...`
           );
 
-          // Ask Claude to generate test code
+          // Ask Claude to generate test code with codebase context
           console.log('🤖 Asking Claude to generate test scenario...');
-          const testPrompt = `Generate Playwright test code to verify the implementation works visually.
+          const testPrompt = `You have access to the full codebase via GitHub. Generate Playwright test code to verify the implementation works visually.
 
-**Original Requirements:**
+**IMPORTANT - Use Codebase Context:**
+Before writing the test code, you should:
+1. Search the codebase for relevant components (e.g., if requirements mention "edit button", search for the component)
+2. Read the component files to find actual selectors (data-testid, aria-labels, classes, etc.)
+3. Use the REAL selectors from the code, not generic guesses
+
+The code is in the GitHub repository: ${owner}/${repo} on branch ${branchName}
+
+**Requirements:**
 ${description}
 
-**Preview URL:** ${previewUrl}
-The browser will start at the preview URL (homepage). This is a web application.
+**Your Task:**
+1. First, search/read the codebase to understand the component structure and find selectors
+2. Then, provide ONLY the Playwright test JavaScript code (no markdown, no explanations)
 
-**IMPORTANT - Routing:**
-- The page is already loaded at the preview URL
-- DO NOT use relative paths like '/products' - the site may have locale/region routing
-- Navigate using visible UI elements (buttons, links, navigation) when possible
-- If you must navigate to a URL, inspect the actual site structure first by waiting for page load
-- For example, if the site uses /<lang>/<region>/<page> structure, use full URLs or click navigation links
+**Preview URL (Base):** ${previewUrl}
+The browser will start at this URL (homepage).
+
+**CRITICAL - Path Handling:**
+- The page is already loaded at ${previewUrl} (may auto-redirect to include locale like /en/)
+- If requirements mention a path like "/en/recharge/mexico/products", you MUST construct the URL correctly
+- Get the page's origin (domain only): const origin = new URL(helpers.page.url()).origin;
+- Then navigate: await helpers.page.goto(origin + '/en/recharge/mexico/products');
+- This prevents doubling locale paths (e.g., /en/en/recharge...)
+
+**Navigation Strategy:**
+1. For specific paths in requirements:
+   - const origin = new URL(helpers.page.url()).origin;
+   - await helpers.page.goto(origin + '/the/path/from/requirements');
+   - await helpers.page.waitForLoadState('networkidle');
+2. For UI navigation, click links/buttons on the page
+3. NEVER use relative paths or hardcode the preview URL structure
 
 **What to test:**
 - Test the specific functionality described in the requirements
+- USE the selectors found in the Component Inspection Results above
 - Capture screenshots at key steps to visually verify behavior
-- Use reliable selectors (data-testid, aria-labels, or specific classes)
+- Wait for elements to be ready before interacting (use waitForSelector)
 
 Provide ONLY the JavaScript code to execute (no markdown, no explanations). The code will be run with:
 - helpers.page (Playwright Page object) - already at ${previewUrl}
 - helpers.captureStep(description) (captures screenshot with description)
 
-Example for testing a modal:
-await helpers.captureStep('Page loaded');
-await helpers.page.click('[data-testid="open-modal-button"]');
+Example structure (adapt based on inspection results):
+const origin = new URL(helpers.page.url()).origin;
+await helpers.page.goto(origin + '/en/recharge/mexico/products?msisdn=+123456');
+await helpers.page.waitForLoadState('networkidle');
+await helpers.captureStep('Products page loaded');
+await helpers.page.waitForSelector('THE_SELECTOR_FROM_INSPECTION');
+await helpers.page.click('THE_SELECTOR_FROM_INSPECTION');
 await helpers.page.waitForTimeout(500);
 await helpers.captureStep('Modal opened');
-await helpers.page.click('body', { position: { x: 10, y: 10 } });
-await helpers.captureStep('Clicked outside modal');
 
 Start your code immediately without any explanation.`;
 
-          const testCodeResponse = await anthropic.messages.create({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 2000,
-            messages: [{
-              role: 'user',
-              content: testPrompt
-            }]
-          });
+          // Create a mini agentic loop for test code generation with file access
+          const testGenMessages: Anthropic.MessageParam[] = [{
+            role: 'user',
+            content: testPrompt
+          }];
 
-          const testCode = testCodeResponse.content
-            .filter(block => block.type === 'text')
-            .map(block => (block as any).text)
-            .join('\n')
-            .replace(/```javascript\n?/g, '')
-            .replace(/```\n?/g, '')
-            .trim();
+          const searchAndReadTools = tools.filter(t =>
+            t.name === 'search_files' || t.name === 'read_file' || t.name === 'list_files'
+          );
+
+          let testCode = '';
+
+          // Mini agentic loop (max 5 turns for searching/reading)
+          for (let turn = 0; turn < 5; turn++) {
+            const testCodeResponse = await anthropic.messages.create({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 4000,
+              tools: searchAndReadTools,
+              messages: testGenMessages
+            });
+
+            testGenMessages.push({
+              role: 'assistant',
+              content: testCodeResponse.content
+            });
+
+            // Extract text content
+            const textContent = testCodeResponse.content
+              .filter(block => block.type === 'text')
+              .map(block => (block as any).text)
+              .join('\n');
+
+            // If we have code, extract it
+            if (textContent.includes('await helpers.page') || textContent.includes('helpers.captureStep')) {
+              testCode = textContent
+                .replace(/```javascript\n?/g, '')
+                .replace(/```\n?/g, '')
+                .trim();
+            }
+
+            // Check if done
+            if (testCodeResponse.stop_reason === 'end_turn') {
+              break;
+            }
+
+            // Process tool uses
+            const hasToolUses = testCodeResponse.content.some(block => block.type === 'tool_use');
+            if (!hasToolUses) break;
+
+            const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+            for (const block of testCodeResponse.content) {
+              if (block.type === 'tool_use') {
+                console.log(`  Test gen tool: ${block.name}`);
+
+                let result: any = null;
+
+                if (block.name === 'search_files') {
+                  const input = block.input as { query: string; file_extension?: string };
+                  try {
+                    const searchQuery = `${input.query}${input.file_extension ? ` extension:${input.file_extension}` : ''} repo:${owner}/${repo}`;
+                    const { data } = await octokit.search.code({
+                      q: searchQuery
+                    });
+                    result = {
+                      success: true,
+                      files: data.items.slice(0, 10).map(item => ({
+                        path: item.path,
+                        score: item.score
+                      }))
+                    };
+                  } catch (error: any) {
+                    result = { error: error.message };
+                  }
+                } else if (block.name === 'read_file') {
+                  const input = block.input as { path: string };
+                  try {
+                    const { data } = await octokit.repos.getContent({
+                      owner,
+                      repo,
+                      path: input.path,
+                      ref: branchName
+                    });
+                    if ('content' in data && typeof data.content === 'string') {
+                      const content = Buffer.from(data.content, 'base64').toString('utf-8');
+                      result = { success: true, path: input.path, content };
+                    } else {
+                      result = { error: 'Path is a directory' };
+                    }
+                  } catch (error: any) {
+                    result = { error: error.message };
+                  }
+                } else if (block.name === 'list_files') {
+                  const input = block.input as { path: string };
+                  try {
+                    const { data } = await octokit.repos.getContent({
+                      owner,
+                      repo,
+                      path: input.path || '',
+                      ref: branchName
+                    });
+                    if (Array.isArray(data)) {
+                      result = {
+                        success: true,
+                        files: data.map(item => ({
+                          name: item.name,
+                          type: item.type,
+                          path: item.path
+                        }))
+                      };
+                    } else {
+                      result = { error: 'Path is not a directory' };
+                    }
+                  } catch (error: any) {
+                    result = { error: error.message };
+                  }
+                }
+
+                toolResults.push({
+                  type: 'tool_result',
+                  tool_use_id: block.id,
+                  content: JSON.stringify(result)
+                });
+              }
+            }
+
+            if (toolResults.length > 0) {
+              testGenMessages.push({
+                role: 'user',
+                content: toolResults
+              });
+            }
+          }
+
+          if (!testCode) {
+            throw new Error('Failed to generate test code');
+          }
 
           console.log('📝 Generated test code:', testCode.substring(0, 200) + '...');
 

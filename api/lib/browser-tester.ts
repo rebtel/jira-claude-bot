@@ -45,12 +45,23 @@ export async function executeBrowserTest(
     console.log(`📍 Navigating to ${previewUrl}...`);
     await page.goto(previewUrl, { waitUntil: 'networkidle' });
 
+    const actualUrl = page.url();
+    console.log(`✓ Page loaded, actual URL: ${actualUrl}`);
+    console.log(`✓ Origin extracted would be: ${new URL(actualUrl).origin}`);
+
     // Take initial screenshot
     const initialScreenshot = await page.screenshot({ fullPage: false });
     steps.push({
       description: 'Initial page load',
       screenshot: initialScreenshot.toString('base64')
     });
+
+    // Wrap page.goto to log navigation attempts
+    const originalGoto = page.goto.bind(page);
+    page.goto = async (url: string, options?: any) => {
+      console.log(`🔗 Test navigating to: ${url}`);
+      return originalGoto(url, options);
+    };
 
     // Create a test helper object that captures screenshots
     const testHelpers = {
@@ -67,7 +78,8 @@ export async function executeBrowserTest(
 
     // Execute the test code in a sandboxed way
     // The test code should use the helpers provided
-    const testFunction = new Function('helpers', testCode);
+    const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    const testFunction = new AsyncFunction('helpers', testCode);
     await testFunction(testHelpers);
 
     console.log(`✅ Test executed successfully with ${steps.length} steps captured`);
