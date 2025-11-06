@@ -643,29 +643,39 @@ async function processIssueAsync(
 
           // Ask Claude to generate test code
           console.log('🤖 Asking Claude to generate test scenario...');
-          const testPrompt = `Based on the original requirements, generate Playwright test code to verify the implementation works visually.
+          const testPrompt = `Generate Playwright test code to verify the implementation works visually.
 
 **Original Requirements:**
 ${description}
 
+**Preview URL:** ${previewUrl}
+The browser will start at the preview URL (homepage). This is a web application.
+
+**IMPORTANT - Routing:**
+- The page is already loaded at the preview URL
+- DO NOT use relative paths like '/products' - the site may have locale/region routing
+- Navigate using visible UI elements (buttons, links, navigation) when possible
+- If you must navigate to a URL, inspect the actual site structure first by waiting for page load
+- For example, if the site uses /<lang>/<region>/<page> structure, use full URLs or click navigation links
+
 **What to test:**
 - Test the specific functionality described in the requirements
 - Capture screenshots at key steps to visually verify behavior
-- Be specific with selectors (you may need to inspect the page)
+- Use reliable selectors (data-testid, aria-labels, or specific classes)
 
-${getTestCodeTemplate(description)}
-
-Provide ONLY the JavaScript code to execute (no markdown, no explanations). The code will be run with access to:
-- helpers.page (Playwright Page object)
+Provide ONLY the JavaScript code to execute (no markdown, no explanations). The code will be run with:
+- helpers.page (Playwright Page object) - already at ${previewUrl}
 - helpers.captureStep(description) (captures screenshot with description)
 
-Example:
-await helpers.captureStep('Initial page load');
-await helpers.page.click('.modal-trigger');
+Example for testing a modal:
+await helpers.captureStep('Page loaded');
+await helpers.page.click('[data-testid="open-modal-button"]');
 await helpers.page.waitForTimeout(500);
 await helpers.captureStep('Modal opened');
 await helpers.page.click('body', { position: { x: 10, y: 10 } });
-await helpers.captureStep('Clicked outside modal - should be closed');`;
+await helpers.captureStep('Clicked outside modal');
+
+Start your code immediately without any explanation.`;
 
           const testCodeResponse = await anthropic.messages.create({
             model: 'claude-sonnet-4-20250514',

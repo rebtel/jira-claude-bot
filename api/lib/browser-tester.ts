@@ -32,9 +32,8 @@ export async function executeBrowserTest(
     // Launch headless Chromium with serverless-optimized settings
     browser = await chromium.launch({
       executablePath,
-      headless: chromiumPkg.headless,
-      args: chromiumPkg.args,
-      defaultViewport: chromiumPkg.defaultViewport
+      headless: true,
+      args: chromiumPkg.args
     });
 
     const context = await browser.newContext({
