@@ -35,11 +35,23 @@ export async function waitForVercelDeployment(
         console.log(`📋 Found ${comments.length} comment(s) on PR #${prNumber}`);
       }
 
-      // Look for Vercel bot comment
-      const vercelComment = comments.find(comment =>
-        (comment.user?.login === 'vercel' || comment.user?.login === 'vercel[bot]' || comment.user?.type === 'Bot') &&
-        (comment.body?.includes('deployed') || comment.body?.includes('Preview'))
-      );
+      // Look for Vercel bot comment that indicates deployment is COMPLETED/READY
+      const vercelComment = comments.find(comment => {
+        if (!(comment.user?.login === 'vercel' || comment.user?.login === 'vercel[bot]' || comment.user?.type === 'Bot')) {
+          return false;
+        }
+
+        const body = comment.body || '';
+
+        // Look for indicators that deployment is COMPLETE and READY
+        // Not just "deploying" or "building" status
+        return (
+          body.includes('Deployment has completed') ||
+          body.includes('Successfully deployed') ||
+          (body.includes('deployed') && body.includes('Preview') && !body.includes('Building')) ||
+          body.includes('Ready')
+        );
+      });
 
       if (vercelComment && vercelComment.body) {
         console.log('🤖 Found Vercel bot comment');
@@ -56,6 +68,8 @@ export async function waitForVercelDeployment(
 
         if (previewLinkMatch && previewLinkMatch[1]) {
           console.log(`✅ Found preview URL via markdown link pattern: ${previewLinkMatch[1]}`);
+          console.log('⏳ Waiting 10s to ensure deployment is fully ready...');
+          await new Promise(resolve => setTimeout(resolve, 10000));
           return previewLinkMatch[1];
         }
 
@@ -66,6 +80,8 @@ export async function waitForVercelDeployment(
 
         if (htmlLinkMatch && htmlLinkMatch[1]) {
           console.log(`✅ Found preview URL via HTML link pattern: ${htmlLinkMatch[1]}`);
+          console.log('⏳ Waiting 10s to ensure deployment is fully ready...');
+          await new Promise(resolve => setTimeout(resolve, 10000));
           return htmlLinkMatch[1];
         }
 
