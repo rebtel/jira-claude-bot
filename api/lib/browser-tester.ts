@@ -1,4 +1,5 @@
 import { chromium } from 'playwright-core';
+import chromiumPkg from '@sparticuz/chromium';
 
 export interface TestStep {
   description: string;
@@ -24,10 +25,16 @@ export async function executeBrowserTest(
   try {
     console.log('🌐 Launching browser...');
 
-    // Launch headless Chromium
+    // Get chromium executable path for serverless environment
+    const executablePath = await chromiumPkg.executablePath();
+    console.log('📍 Chromium executable path:', executablePath);
+
+    // Launch headless Chromium with serverless-optimized settings
     browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      executablePath,
+      headless: chromiumPkg.headless,
+      args: chromiumPkg.args,
+      defaultViewport: chromiumPkg.defaultViewport
     });
 
     const context = await browser.newContext({
