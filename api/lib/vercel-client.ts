@@ -44,19 +44,37 @@ export async function waitForVercelDeployment(
       if (vercelComment && vercelComment.body) {
         console.log('🤖 Found Vercel bot comment');
         if (attempts === 0) {
-          console.log('💬 Comment body:', vercelComment.body.substring(0, 200));
+          console.log('💬 Comment body:', vercelComment.body.substring(0, 500));
         }
 
-        // Extract preview URL from comment
-        // Match URLs from various formats: markdown links, HTML, or plain URLs
-        // Support both .vercel.app and custom domains
+        const repoName = repo.toLowerCase();
+
+        // Strategy 1: Look for markdown link with "Preview – {repo-name}" text
+        // Format: [Preview – rebtel-web](https://url)
+        const previewLinkPattern = new RegExp(`\\[Preview\\s*[–-]\\s*${repo}\\]\\((https:\\/\\/[^\\)]+)\\)`, 'i');
+        const previewLinkMatch = vercelComment.body.match(previewLinkPattern);
+
+        if (previewLinkMatch && previewLinkMatch[1]) {
+          console.log(`✅ Found preview URL via markdown link pattern: ${previewLinkMatch[1]}`);
+          return previewLinkMatch[1];
+        }
+
+        // Strategy 2: Look for HTML link with "Preview – {repo-name}" text
+        // Format: <a href="https://url">Preview – rebtel-web</a>
+        const htmlLinkPattern = new RegExp(`<a[^>]*href=["'](https:\\/\\/[^"']+)["'][^>]*>Preview\\s*[–-]\\s*${repo}<\\/a>`, 'i');
+        const htmlLinkMatch = vercelComment.body.match(htmlLinkPattern);
+
+        if (htmlLinkMatch && htmlLinkMatch[1]) {
+          console.log(`✅ Found preview URL via HTML link pattern: ${htmlLinkMatch[1]}`);
+          return htmlLinkMatch[1];
+        }
+
+        // Strategy 3: Fallback - extract all URLs and filter
+        console.log('🔍 Trying fallback URL extraction...');
         const urlMatches = vercelComment.body.match(/https:\/\/[^\s\)\]<>"]+/g);
 
         if (urlMatches && urlMatches.length > 0) {
           console.log(`🔗 Found ${urlMatches.length} deployment URL(s):`, urlMatches);
-
-          // Filter to get the main deployment (repo name), not storybook or other deployments
-          const repoName = repo.toLowerCase();
 
           // First, filter out obvious non-deployment URLs (GitHub, avatars, etc.)
           const deploymentUrls = urlMatches.filter(url => {
@@ -73,41 +91,19 @@ export async function waitForVercelDeployment(
 
           if (deploymentUrls.length === 0) {
             console.log('⚠️ No deployment URLs found after filtering');
-            return null;
-          }
+          } else {
+            // Look for URL not containing "storybook"
+            const mainDeployment = deploymentUrls.find(url =>
+              !url.toLowerCase().includes('storybook')
+            );
 
-          // Look for URL containing repo name (not storybook)
-          const mainDeployment = deploymentUrls.find(url => {
-            const urlLower = url.toLowerCase();
-            // Skip storybook deployments
-            if (urlLower.includes('storybook')) {
-              console.log(`⏭️  Skipping Storybook deployment: ${url}`);
-              return false;
+            if (mainDeployment) {
+              console.log(`✅ Using first non-Storybook deployment: ${mainDeployment}`);
+              return mainDeployment;
             }
-            // Prefer URLs that contain the repo name
-            if (urlLower.includes(repoName)) {
-              return true;
-            }
-            return false;
-          });
 
-          // If we found a repo-specific deployment, use it
-          if (mainDeployment) {
-            console.log(`✅ Found main deployment with repo name: ${mainDeployment}`);
-            return mainDeployment;
+            console.log('⚠️ Only found Storybook deployments');
           }
-
-          // Otherwise, take the first non-storybook deployment
-          const firstNonStorybook = deploymentUrls.find(url =>
-            !url.toLowerCase().includes('storybook')
-          );
-
-          if (firstNonStorybook) {
-            console.log(`✅ Using first non-Storybook deployment: ${firstNonStorybook}`);
-            return firstNonStorybook;
-          }
-
-          console.log('⚠️ Only found Storybook deployments, waiting for main deployment...');
         }
       }
 
