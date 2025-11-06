@@ -208,19 +208,26 @@ async function processIssueAsync(
           if (block.type === 'text') {
             const text = (block as any).text;
             console.log(`  Checking text block (${text.length} chars, contains helpers.page: ${text.includes('helpers.page')})`);
-            // Look for code that seems like Playwright test code
+
+            // Look for inline test code with helpers API
             if (text.includes('helpers.page') || text.includes('helpers.captureStep')) {
               generatedTestCode = text.replace(/```(javascript|js)?\n?/g, '').replace(/```/g, '').trim();
-              console.log('✓ Captured test code from Claude');
+              console.log('✓ Captured test code from Claude (helpers API detected)');
               if (generatedTestCode) {
                 console.log('  First 200 chars:', generatedTestCode.substring(0, Math.min(200, generatedTestCode.length)));
               }
               break;
             }
+            // Fallback: check if it looks like code but in wrong format
+            else if (text.includes('await page.') || text.includes('test.describe')) {
+              console.log('⚠️ Detected Playwright code but in wrong format (has imports/test blocks)');
+              console.log('  This needs to be inline code using helpers.page, not full test files');
+            }
           }
         }
         if (!generatedTestCode) {
           console.log('⚠️ No test code found in response after PR creation');
+          console.log('  Expected inline code using helpers.page and helpers.captureStep');
         }
       }
 
@@ -587,7 +594,23 @@ async function processIssueAsync(
                     success: true,
                     pr_url: pr.html_url,
                     pr_number: pr.number,
-                    message: 'PR created successfully. Now please generate Playwright test code to verify your implementation works. Based on the files you just modified and read, provide JavaScript code that uses the ACTUAL selectors from the components (data-testid, aria-labels, classes you saw in the code). Format: just the code, no markdown.'
+                    message: `PR created successfully. Now generate INLINE Playwright test code for visual verification.
+
+CRITICAL FORMAT REQUIREMENTS:
+- NO imports, NO test.describe blocks, NO test() functions
+- Just raw async code that will be executed directly
+- Use: helpers.page (Playwright page object)
+- Use: await helpers.captureStep('description') to take screenshots
+- Use the ACTUAL selectors you saw in the component files (data-testid, aria-labels, etc.)
+
+Example format:
+const origin = new URL(helpers.page.url()).origin;
+await helpers.page.goto(origin + '/en/products?msisdn=+123');
+await helpers.captureStep('Page loaded');
+await helpers.page.click('[data-testid="edit-button"]');
+await helpers.captureStep('Modal opened');
+
+Generate ONLY the inline code, no explanations:`
                   };
                   console.log(`✓ PR created: ${pr.html_url}`);
                   console.log('📝 Requesting test code generation from Claude...');
