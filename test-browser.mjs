@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { chromium } from 'playwright-core';
 import chromiumPkg from '@sparticuz/chromium';
@@ -5,14 +6,59 @@ import chromiumPkg from '@sparticuz/chromium';
 // === CONFIGURE THESE ===
 const PREVIEW_URL = 'https://rebtel-web-git-fe-3721-implementation.reblab.net'; // Replace with actual preview URL
 const JIRA_DESCRIPTION = `
+On the /products page, users can edit their phone number by clicking the edit icon, which opens a modal dialog with a phone number input field. Currently, users can only close this modal using the "Cancel" button that appears inside the modal.
+
+Description
+
+Allow users to close the modal by clicking in the dark overlay area outside the modal, matching the same behavior as the "Cancel" button.
+
+  Business Rules:
+
+When a phone number exists in state:
+
+User should be able to close the modal by clicking outside (in the dark overlay)
+
+This matches existing Cancel button behavior (which is visible in this scenario)
+
+When NO phone number exists in state:
+
+Clicking outside the modal should do nothing (no feedback/animation needed)
+
+Modal must remain open until user submits a valid phone number
+
+This matches existing Cancel button behavior (button is hidden in this scenario)
+
+Products cannot be displayed without a phone number, so modal closure must be blocked
+
+  Current Behavior:
+
+Clicking outside the modal is currently always blocked
+
+Cancel button correctly shows/hides based on phone number existence
+
+  Expected Behavior:
+
+Clicking outside modal should close it only when phoneNumber exists
+
+When no phone number exists, clicking outside does nothing (modal stays open, no feedback)
+
+
+
+Acceptance Criteria:
+
+When phone number exists: clicking outside modal closes it
+
+When phone number exists: Cancel button still works
+
+When NO phone number exists: clicking outside does NOT close modal
+
+When NO phone number exists: no feedback/animation when clicking outside
+
+Phone number validation requirements unchanged
+
+
+
 repo: rebtel/rebtel-web
-
-Add a new feature to the products page that displays a promotional banner.
-
-Requirements:
-- Banner should appear at the top of the products page
-- Should be dismissible with an X button
-- Should show "Special Offer: 20% off!"
 `.trim();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
