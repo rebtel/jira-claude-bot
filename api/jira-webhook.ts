@@ -29,7 +29,6 @@ export default async function handler(
     console.log('=== Webhook received ===');
     console.log('Method:', req.method);
     console.log('Content-Type:', req.headers['content-type']);
-    console.log('Raw body:', JSON.stringify(req.body, null, 2));
 
     // Verify webhook (optional but recommended)
     // TEMPORARILY DISABLED FOR TESTING
