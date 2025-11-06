@@ -38,15 +38,19 @@ export async function waitForVercelDeployment(
         per_page: 10
       });
 
-      if (attempts === 0) {
-        console.log(`📋 Found ${deployments.length} deployment(s) for PR #${prNumber}`);
+      console.log(`📋 Found ${deployments.length} deployment(s) for PR #${prNumber} (attempt ${attempts + 1})`);
+
+      if (deployments.length === 0) {
+        console.log('⚠️ No deployments found. Vercel may not be integrated or deployment not created yet.');
       }
 
       // Look for deployments by vercel[bot]
       for (const deployment of deployments) {
-        if (attempts === 0) {
-          console.log(`🔍 Checking deployment: environment="${deployment.environment}", task="${deployment.task}"`);
-        }
+        console.log(`\n🔍 Deployment ID: ${deployment.id}`);
+        console.log(`   Environment: "${deployment.environment}"`);
+        console.log(`   Task: "${deployment.task}"`);
+        console.log(`   Created by: ${deployment.creator?.login || 'unknown'}`);
+        console.log(`   Ref: ${deployment.ref}`);
 
         // Get deployment statuses to check if it's ready
         const { data: statuses } = await octokit.repos.listDeploymentStatuses({
@@ -56,9 +60,11 @@ export async function waitForVercelDeployment(
           per_page: 10
         });
 
-        if (attempts === 0 && statuses.length > 0) {
-          console.log(`   Latest status: ${statuses[0].state} (${statuses[0].description || 'no description'})`);
-        }
+        console.log(`   Found ${statuses.length} status(es) for this deployment:`);
+
+        statuses.forEach((status, idx) => {
+          console.log(`   Status ${idx + 1}: state="${status.state}", env_url="${status.environment_url || 'none'}", description="${status.description || 'none'}"`);
+        });
 
         // Look for successful deployment with environment URL
         const successStatus = statuses.find(s => s.state === 'success');
