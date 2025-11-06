@@ -732,16 +732,31 @@ Start your code immediately without any explanation.`;
               .map(block => (block as any).text)
               .join('\n');
 
-            // If we have code, extract it
-            if (textContent.includes('await helpers.page') || textContent.includes('helpers.captureStep')) {
-              testCode = textContent
+            console.log(`  Turn ${turn + 1} text content (first 300 chars):`, textContent.substring(0, 300));
+
+            // Try to extract code - look for code blocks or direct code
+            if (textContent) {
+              // Remove markdown code blocks
+              let extractedCode = textContent
                 .replace(/```javascript\n?/g, '')
+                .replace(/```js\n?/g, '')
                 .replace(/```\n?/g, '')
                 .trim();
+
+              // If we see Playwright code, save it
+              if (extractedCode.includes('helpers.page') || extractedCode.includes('helpers.captureStep')) {
+                testCode = extractedCode;
+                console.log('  ✓ Found test code with helpers');
+              } else if (extractedCode.includes('await ') && extractedCode.includes('.goto')) {
+                // Sometimes it might not use helpers variable name
+                testCode = extractedCode;
+                console.log('  ✓ Found test code with goto');
+              }
             }
 
             // Check if done
             if (testCodeResponse.stop_reason === 'end_turn') {
+              console.log(`  Stop reason: end_turn at turn ${turn + 1}`);
               break;
             }
 
@@ -835,7 +850,23 @@ Start your code immediately without any explanation.`;
           }
 
           if (!testCode) {
-            throw new Error('Failed to generate test code');
+            console.error('❌ Failed to generate test code');
+            console.error('Final messages:', JSON.stringify(testGenMessages, null, 2).substring(0, 1000));
+
+            await addJiraComment(
+              issueKey,
+              `❌ **Browser Test Generation Failed**\n\nCould not generate test code after searching the codebase. This might mean:\n- The components mentioned in the requirements don't exist yet\n- The selectors couldn't be determined from the code\n\nSkipping browser tests for now.`
+            );
+
+            // Don't throw, just skip browser testing
+            console.log('Skipping browser tests due to code generation failure');
+            // Continue to post comment and complete
+            const prUrl = `https://github.com/${owner}/${repo}/pull/${createdPrNumber}`;
+            await addJiraComment(
+              issueKey,
+              `✅ **Implementation Complete** (Browser tests skipped)\n\nPull Request: ${prUrl}`
+            );
+            return;
           }
 
           console.log('📝 Generated test code:', testCode.substring(0, 200) + '...');
