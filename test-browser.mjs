@@ -76,14 +76,26 @@ async function executeBrowserTest(previewUrl, testCode) {
 
   try {
     console.log('🌐 Launching browser...');
-    const executablePath = await chromiumPkg.executablePath();
-    console.log('📍 Chromium executable path:', executablePath);
 
-    browser = await chromium.launch({
-      executablePath,
-      headless: true,
-      args: chromiumPkg.args
-    });
+    // Detect if running locally or in serverless environment
+    const isLocal = !process.env.AWS_LAMBDA_FUNCTION_VERSION && !process.env.VERCEL;
+
+    if (isLocal) {
+      console.log('📍 Running locally - using Playwright Chromium');
+      // Use Playwright's installed Chromium for local testing
+      browser = await chromium.launch({
+        headless: true
+      });
+    } else {
+      console.log('📍 Running in serverless - using @sparticuz/chromium');
+      const executablePath = await chromiumPkg.executablePath();
+      console.log('   Executable path:', executablePath);
+      browser = await chromium.launch({
+        executablePath,
+        headless: true,
+        args: chromiumPkg.args
+      });
+    }
 
     const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     const page = await context.newPage();
