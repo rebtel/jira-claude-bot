@@ -37,23 +37,47 @@ export async function waitForVercelDeployment(
 
       // Look for Vercel bot comment
       const vercelComment = comments.find(comment =>
-        (comment.user?.login === 'vercel[bot]' || comment.user?.type === 'Bot') &&
-        comment.body?.includes('Successfully deployed')
+        (comment.user?.login === 'vercel' || comment.user?.login === 'vercel[bot]' || comment.user?.type === 'Bot') &&
+        (comment.body?.includes('deployed') || comment.body?.includes('Preview'))
       );
 
       if (vercelComment && vercelComment.body) {
         console.log('🤖 Found Vercel bot comment');
+        if (attempts === 0) {
+          console.log('💬 Comment body:', vercelComment.body.substring(0, 200));
+        }
 
         // Extract preview URL from comment
-        // Vercel comments typically have format: [Visit Preview](https://preview-url.vercel.app)
-        const urlMatches = vercelComment.body.match(/https:\/\/[^\s\)]+\.vercel\.app[^\s\)]*/g);
+        // Match URLs from various formats: markdown links, HTML, or plain URLs
+        // Support both .vercel.app and custom domains
+        const urlMatches = vercelComment.body.match(/https:\/\/[^\s\)\]<>"]+/g);
 
         if (urlMatches && urlMatches.length > 0) {
-          console.log(`🔗 Found ${urlMatches.length} deployment URL(s)`);
+          console.log(`🔗 Found ${urlMatches.length} deployment URL(s):`, urlMatches);
 
           // Filter to get the main deployment (repo name), not storybook or other deployments
           const repoName = repo.toLowerCase();
-          const mainDeployment = urlMatches.find(url => {
+
+          // First, filter out obvious non-deployment URLs (GitHub, avatars, etc.)
+          const deploymentUrls = urlMatches.filter(url => {
+            const urlLower = url.toLowerCase();
+            if (urlLower.includes('github.com') ||
+                urlLower.includes('githubusercontent.com') ||
+                urlLower.includes('avatar')) {
+              return false;
+            }
+            return true;
+          });
+
+          console.log(`🔍 After filtering, ${deploymentUrls.length} potential deployment URL(s)`);
+
+          if (deploymentUrls.length === 0) {
+            console.log('⚠️ No deployment URLs found after filtering');
+            return null;
+          }
+
+          // Look for URL containing repo name (not storybook)
+          const mainDeployment = deploymentUrls.find(url => {
             const urlLower = url.toLowerCase();
             // Skip storybook deployments
             if (urlLower.includes('storybook')) {
@@ -69,12 +93,12 @@ export async function waitForVercelDeployment(
 
           // If we found a repo-specific deployment, use it
           if (mainDeployment) {
-            console.log(`✅ Found main deployment: ${mainDeployment}`);
+            console.log(`✅ Found main deployment with repo name: ${mainDeployment}`);
             return mainDeployment;
           }
 
           // Otherwise, take the first non-storybook deployment
-          const firstNonStorybook = urlMatches.find(url =>
+          const firstNonStorybook = deploymentUrls.find(url =>
             !url.toLowerCase().includes('storybook')
           );
 
