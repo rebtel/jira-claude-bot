@@ -23,108 +23,70 @@ export async function waitForVercelDeployment(
 
   while (attempts < maxAttempts) {
     try {
-      // Get all comments on the PR
-      const { data: comments } = await octokit.issues.listComments({
+      // Get PR info to get the head ref
+      const { data: pr } = await octokit.pulls.get({
         owner,
         repo,
-        issue_number: prNumber,
-        per_page: 100
+        pull_number: prNumber
+      });
+
+      // Get deployments for this PR's branch from the Environments section
+      const { data: deployments } = await octokit.repos.listDeployments({
+        owner,
+        repo,
+        ref: pr.head.ref,
+        per_page: 10
       });
 
       if (attempts === 0) {
-        console.log(`📋 Found ${comments.length} comment(s) on PR #${prNumber}`);
+        console.log(`📋 Found ${deployments.length} deployment(s) for PR #${prNumber}`);
       }
 
-      // Look for Vercel bot comment that indicates deployment is COMPLETED/READY
-      const vercelComment = comments.find(comment => {
-        if (!(comment.user?.login === 'vercel' || comment.user?.login === 'vercel[bot]' || comment.user?.type === 'Bot')) {
-          return false;
-        }
-
-        const body = comment.body || '';
-
-        // Look for indicators that deployment is COMPLETE and READY
-        // Not just "deploying" or "building" status
-        return (
-          body.includes('Deployment has completed') ||
-          body.includes('Successfully deployed') ||
-          (body.includes('deployed') && body.includes('Preview') && !body.includes('Building')) ||
-          body.includes('Ready')
-        );
-      });
-
-      if (vercelComment && vercelComment.body) {
-        console.log('🤖 Found Vercel bot comment');
+      // Look for deployments by vercel[bot]
+      for (const deployment of deployments) {
         if (attempts === 0) {
-          console.log('💬 Comment body:', vercelComment.body.substring(0, 500));
+          console.log(`🔍 Checking deployment: environment="${deployment.environment}", task="${deployment.task}"`);
         }
 
-        const repoName = repo.toLowerCase();
+        // Get deployment statuses to check if it's ready
+        const { data: statuses } = await octokit.repos.listDeploymentStatuses({
+          owner,
+          repo,
+          deployment_id: deployment.id,
+          per_page: 10
+        });
 
-        // Strategy 1: Look for markdown link with "Preview – {repo-name}" text
-        // Format: [Preview – rebtel-web](https://url)
-        const previewLinkPattern = new RegExp(`\\[Preview\\s*[–-]\\s*${repo}\\]\\((https:\\/\\/[^\\)]+)\\)`, 'i');
-        const previewLinkMatch = vercelComment.body.match(previewLinkPattern);
-
-        if (previewLinkMatch && previewLinkMatch[1]) {
-          console.log(`✅ Found preview URL via markdown link pattern: ${previewLinkMatch[1]}`);
-          console.log('⏳ Waiting 10s to ensure deployment is fully ready...');
-          await new Promise(resolve => setTimeout(resolve, 10000));
-          return previewLinkMatch[1];
+        if (attempts === 0 && statuses.length > 0) {
+          console.log(`   Latest status: ${statuses[0].state} (${statuses[0].description || 'no description'})`);
         }
 
-        // Strategy 2: Look for HTML link with "Preview – {repo-name}" text
-        // Format: <a href="https://url">Preview – rebtel-web</a>
-        const htmlLinkPattern = new RegExp(`<a[^>]*href=["'](https:\\/\\/[^"']+)["'][^>]*>Preview\\s*[–-]\\s*${repo}<\\/a>`, 'i');
-        const htmlLinkMatch = vercelComment.body.match(htmlLinkPattern);
+        // Look for successful deployment with environment URL
+        const successStatus = statuses.find(s => s.state === 'success');
 
-        if (htmlLinkMatch && htmlLinkMatch[1]) {
-          console.log(`✅ Found preview URL via HTML link pattern: ${htmlLinkMatch[1]}`);
-          console.log('⏳ Waiting 10s to ensure deployment is fully ready...');
-          await new Promise(resolve => setTimeout(resolve, 10000));
-          return htmlLinkMatch[1];
-        }
+        if (successStatus && successStatus.environment_url) {
+          const envUrl = successStatus.environment_url;
+          const envName = deployment.environment?.toLowerCase() || '';
 
-        // Strategy 3: Fallback - extract all URLs and filter
-        console.log('🔍 Trying fallback URL extraction...');
-        const urlMatches = vercelComment.body.match(/https:\/\/[^\s\)\]<>"]+/g);
-
-        if (urlMatches && urlMatches.length > 0) {
-          console.log(`🔗 Found ${urlMatches.length} deployment URL(s):`, urlMatches);
-
-          // First, filter out obvious non-deployment URLs (GitHub, avatars, etc.)
-          const deploymentUrls = urlMatches.filter(url => {
-            const urlLower = url.toLowerCase();
-            if (urlLower.includes('github.com') ||
-                urlLower.includes('githubusercontent.com') ||
-                urlLower.includes('avatar')) {
-              return false;
-            }
-            return true;
-          });
-
-          console.log(`🔍 After filtering, ${deploymentUrls.length} potential deployment URL(s)`);
-
-          if (deploymentUrls.length === 0) {
-            console.log('⚠️ No deployment URLs found after filtering');
-          } else {
-            // Look for URL not containing "storybook"
-            const mainDeployment = deploymentUrls.find(url =>
-              !url.toLowerCase().includes('storybook')
-            );
-
-            if (mainDeployment) {
-              console.log(`✅ Using first non-Storybook deployment: ${mainDeployment}`);
-              return mainDeployment;
-            }
-
-            console.log('⚠️ Only found Storybook deployments');
+          // Skip storybook deployments
+          if (envName.includes('storybook') || envUrl.toLowerCase().includes('storybook')) {
+            console.log(`⏭️  Skipping Storybook deployment: ${envUrl}`);
+            continue;
           }
+
+          // Found a successful non-storybook preview deployment!
+          console.log(`✅ Found ready deployment in environment: ${deployment.environment}`);
+          console.log(`🔗 Preview URL: ${envUrl}`);
+
+          // Small safety delay to ensure deployment is fully ready
+          console.log('⏳ Waiting 5s to ensure deployment is serving traffic...');
+          await new Promise(resolve => setTimeout(resolve, 5000));
+
+          return envUrl;
         }
       }
 
       attempts++;
-      console.log(`⏳ Attempt ${attempts}/${maxAttempts} - Vercel comment not found yet, waiting 10s...`);
+      console.log(`⏳ Attempt ${attempts}/${maxAttempts} - No ready deployment found yet, waiting 10s...`);
       await new Promise(resolve => setTimeout(resolve, 10000));
 
     } catch (error) {
@@ -134,6 +96,6 @@ export async function waitForVercelDeployment(
     }
   }
 
-  console.log('❌ Timeout waiting for Vercel deployment');
+  console.log('❌ Timeout waiting for Vercel deployment to be ready');
   return null;
 }
