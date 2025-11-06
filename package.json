@@ -6,7 +6,8 @@
     "dev": "vercel dev",
     "deploy": "vercel --prod",
     "test": "playwright test",
-    "test:ui": "playwright test --ui"
+    "test:ui": "playwright test --ui",
+    "test:browser": "node test-browser.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
