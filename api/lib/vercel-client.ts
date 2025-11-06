@@ -7,6 +7,7 @@ export interface VercelDeployment {
 
 /**
  * Wait for a Vercel preview deployment to be ready for a given PR
+ * Parses Vercel bot's comment to get the preview URL
  */
 export async function waitForVercelDeployment(
   octokit: Octokit,
@@ -22,92 +23,72 @@ export async function waitForVercelDeployment(
 
   while (attempts < maxAttempts) {
     try {
-      // Get the latest commit status for the PR
-      const { data: pr } = await octokit.pulls.get({
+      // Get all comments on the PR
+      const { data: comments } = await octokit.issues.listComments({
         owner,
         repo,
-        pull_number: prNumber
-      });
-
-      const headSha = pr.head.sha;
-
-      // Check for deployment status (legacy status API)
-      const { data: statuses } = await octokit.repos.listCommitStatusesForRef({
-        owner,
-        repo,
-        ref: headSha
+        issue_number: prNumber,
+        per_page: 100
       });
 
       if (attempts === 0) {
-        console.log('📋 Available statuses:', statuses.map(s => ({ context: s.context, state: s.state })));
+        console.log(`📋 Found ${comments.length} comment(s) on PR #${prNumber}`);
       }
 
-      // Look for Vercel deployment status
-      const vercelStatus = statuses.find(s =>
-        s.context?.toLowerCase().includes('vercel') ||
-        s.context?.toLowerCase().includes('deployment')
+      // Look for Vercel bot comment
+      const vercelComment = comments.find(comment =>
+        (comment.user?.login === 'vercel[bot]' || comment.user?.type === 'Bot') &&
+        comment.body?.includes('Successfully deployed')
       );
 
-      if (vercelStatus) {
-        console.log(`🔍 Found Vercel status: ${vercelStatus.context} - ${vercelStatus.state}`);
-        if (vercelStatus.state === 'success' && vercelStatus.target_url) {
-          console.log(`✅ Vercel deployment ready: ${vercelStatus.target_url}`);
-          return vercelStatus.target_url;
-        }
-      }
+      if (vercelComment && vercelComment.body) {
+        console.log('🤖 Found Vercel bot comment');
 
-      // Check Checks API (newer GitHub API that Vercel might use)
-      const { data: checkRuns } = await octokit.checks.listForRef({
-        owner,
-        repo,
-        ref: headSha
-      });
+        // Extract preview URL from comment
+        // Vercel comments typically have format: [Visit Preview](https://preview-url.vercel.app)
+        const urlMatches = vercelComment.body.match(/https:\/\/[^\s\)]+\.vercel\.app[^\s\)]*/g);
 
-      if (attempts === 0) {
-        console.log('📋 Available checks:', checkRuns.check_runs.map(c => ({ name: c.name, status: c.status, conclusion: c.conclusion })));
-      }
+        if (urlMatches && urlMatches.length > 0) {
+          console.log(`🔗 Found ${urlMatches.length} deployment URL(s)`);
 
-      const vercelCheck = checkRuns.check_runs.find(c =>
-        c.name.toLowerCase().includes('vercel') ||
-        c.name.toLowerCase().includes('deployment')
-      );
+          // Filter to get the main deployment (repo name), not storybook or other deployments
+          const repoName = repo.toLowerCase();
+          const mainDeployment = urlMatches.find(url => {
+            const urlLower = url.toLowerCase();
+            // Skip storybook deployments
+            if (urlLower.includes('storybook')) {
+              console.log(`⏭️  Skipping Storybook deployment: ${url}`);
+              return false;
+            }
+            // Prefer URLs that contain the repo name
+            if (urlLower.includes(repoName)) {
+              return true;
+            }
+            return false;
+          });
 
-      if (vercelCheck) {
-        console.log(`🔍 Found Vercel check: ${vercelCheck.name} - ${vercelCheck.status} (${vercelCheck.conclusion})`);
-        if (vercelCheck.status === 'completed' && vercelCheck.conclusion === 'success' && vercelCheck.details_url) {
-          console.log(`✅ Vercel deployment ready: ${vercelCheck.details_url}`);
-          return vercelCheck.details_url;
-        }
-      }
+          // If we found a repo-specific deployment, use it
+          if (mainDeployment) {
+            console.log(`✅ Found main deployment: ${mainDeployment}`);
+            return mainDeployment;
+          }
 
-      // Also check deployment API
-      const { data: deployments } = await octokit.repos.listDeployments({
-        owner,
-        repo,
-        ref: pr.head.ref,
-        per_page: 5
-      });
+          // Otherwise, take the first non-storybook deployment
+          const firstNonStorybook = urlMatches.find(url =>
+            !url.toLowerCase().includes('storybook')
+          );
 
-      if (attempts === 0 && deployments.length > 0) {
-        console.log(`📋 Found ${deployments.length} deployment(s)`);
-      }
+          if (firstNonStorybook) {
+            console.log(`✅ Using first non-Storybook deployment: ${firstNonStorybook}`);
+            return firstNonStorybook;
+          }
 
-      for (const deployment of deployments) {
-        const { data: deploymentStatuses } = await octokit.repos.listDeploymentStatuses({
-          owner,
-          repo,
-          deployment_id: deployment.id
-        });
-
-        const successStatus = deploymentStatuses.find(s => s.state === 'success');
-        if (successStatus && successStatus.environment_url) {
-          console.log(`✅ Vercel deployment ready via Deployments API: ${successStatus.environment_url}`);
-          return successStatus.environment_url;
+          console.log('⚠️ Only found Storybook deployments, waiting for main deployment...');
         }
       }
 
       attempts++;
-      console.log(`⏳ Attempt ${attempts}/${maxAttempts} - Deployment not ready yet, waiting 10s...`);
+      console.log(`⏳ Attempt ${attempts}/${maxAttempts} - Vercel comment not found yet, waiting 10s...`);
       await new Promise(resolve => setTimeout(resolve, 10000));
 
     } catch (error) {
