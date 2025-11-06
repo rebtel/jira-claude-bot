@@ -30,6 +30,31 @@ export async function waitForVercelDeployment(
         pull_number: prNumber
       });
 
+      // === DIAGNOSTIC LOGGING - ONLY ON FIRST ATTEMPT ===
+      if (attempts === 0) {
+        console.log('\n=== DIAGNOSTIC INFO (first attempt only) ===');
+        console.log('PR head ref:', pr.head.ref);
+        console.log('PR head sha:', pr.head.sha);
+
+        // Get all comments
+        const { data: comments } = await octokit.issues.listComments({
+          owner,
+          repo,
+          issue_number: prNumber,
+          per_page: 100
+        });
+
+        console.log(`\nFound ${comments.length} comments on PR:`);
+        comments.forEach((comment, idx) => {
+          if (comment.user?.login?.includes('vercel') || comment.body?.toLowerCase().includes('vercel') || comment.body?.toLowerCase().includes('preview')) {
+            console.log(`\nComment ${idx + 1} by ${comment.user?.login}:`);
+            console.log('Body (first 500 chars):', comment.body?.substring(0, 500));
+            console.log('Full body:', JSON.stringify(comment.body));
+          }
+        });
+        console.log('=== END DIAGNOSTIC INFO ===\n');
+      }
+
       // Get deployments for this PR's branch from the Environments section
       const { data: deployments } = await octokit.repos.listDeployments({
         owner,
