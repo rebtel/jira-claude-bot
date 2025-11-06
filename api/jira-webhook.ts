@@ -9,7 +9,7 @@ import { validateTicketContent } from './lib/ai-validator.js';
 import { reviewCodeChanges } from './lib/ai-reviewer.js';
 import { getAgentTools, getInitialPrompt } from './lib/agent-tools.js';
 import { waitForVercelDeployment } from './lib/vercel-client.js';
-import { executeBrowserTest, getTestCodeTemplate } from './lib/browser-tester.js';
+import { executeBrowserTest } from './lib/browser-tester.js';
 import type { ReviewResult } from './lib/types.js';
 
 /**
@@ -180,6 +180,7 @@ async function processIssueAsync(
     let reviewCompleted = false; // Track if code review has been done
     let lastReviewResult: ReviewResult | null = null; // Store last review result
     let createdPrNumber: number | null = null; // Track created PR for browser testing
+    let generatedTestCode: string | null = null; // Store test code from Claude
 
     // Agentic loop (increased limit to allow for codebase exploration)
     for (let i = 0; i < 25; i++) {
@@ -199,6 +200,29 @@ async function processIssueAsync(
         role: 'assistant',
         content: response.content
       });
+
+      // Capture test code if PR was just created
+      if (createdPrNumber && !generatedTestCode) {
+        console.log('🔍 Looking for test code in response...');
+        for (const block of response.content) {
+          if (block.type === 'text') {
+            const text = (block as any).text;
+            console.log(`  Checking text block (${text.length} chars, contains helpers.page: ${text.includes('helpers.page')})`);
+            // Look for code that seems like Playwright test code
+            if (text.includes('helpers.page') || text.includes('helpers.captureStep')) {
+              generatedTestCode = text.replace(/```(javascript|js)?\n?/g, '').replace(/```/g, '').trim();
+              console.log('✓ Captured test code from Claude');
+              if (generatedTestCode) {
+                console.log('  First 200 chars:', generatedTestCode.substring(0, Math.min(200, generatedTestCode.length)));
+              }
+              break;
+            }
+          }
+        }
+        if (!generatedTestCode) {
+          console.log('⚠️ No test code found in response after PR creation');
+        }
+      }
 
       // Check if we're done
       if (response.stop_reason === 'end_turn') {
@@ -559,8 +583,14 @@ async function processIssueAsync(
                     base: defaultBranch
                   });
                   createdPrNumber = pr.number; // Store for browser testing
-                  result = { success: true, pr_url: pr.html_url, pr_number: pr.number };
+                  result = {
+                    success: true,
+                    pr_url: pr.html_url,
+                    pr_number: pr.number,
+                    message: 'PR created successfully. Now please generate Playwright test code to verify your implementation works. Based on the files you just modified and read, provide JavaScript code that uses the ACTUAL selectors from the components (data-testid, aria-labels, classes you saw in the code). Format: just the code, no markdown.'
+                  };
                   console.log(`✓ PR created: ${pr.html_url}`);
+                  console.log('📝 Requesting test code generation from Claude...');
 
                   // Post success comment to Jira with PR link
                   try {
@@ -617,428 +647,103 @@ async function processIssueAsync(
       }
     }
 
-    // === BROWSER TESTING PHASE ===
-    // Only run if a PR was created
+    // === COMPLETION ===
     if (createdPrNumber) {
-      console.log('\n=== 🌐 Starting Browser Testing Phase ===');
+      console.log('\n=== ✅ Implementation Complete ===');
+      console.log(`   PR Number: ${createdPrNumber}`);
+      console.log(`   Test code generated: ${!!generatedTestCode}`);
 
       try {
-        // Wait for Vercel deployment
+        const prUrl = `https://github.com/${owner}/${repo}/pull/${createdPrNumber}`;
+
+        await addJiraComment(
+          issueKey,
+          `✅ **Implementation Complete**\n\n` +
+          `Pull Request: [#${createdPrNumber}](${prUrl})\n\n` +
+          `**Next Steps:**\n` +
+          `- Waiting for Vercel preview deployment\n` +
+          `- Will run automated visual verification\n` +
+          `- Review the code changes in the PR\n` +
+          `- Merge when ready!`
+        );
+
+        console.log('\n=== 🌐 Starting Visual Verification Phase ===');
+        // Wait for Vercel preview deployment
+        console.log('⏳ Waiting for Vercel preview deployment (max 5 min)...');
         const previewUrl = await waitForVercelDeployment(octokit, owner, repo, createdPrNumber, 5);
 
         if (!previewUrl) {
-          console.log('⚠️ Could not get Vercel preview URL, skipping browser tests');
+          console.log('⚠️ Could not get Vercel preview URL within timeout');
           await addJiraComment(
             issueKey,
-            `⚠️ **Browser Testing Skipped**\n\nCould not detect Vercel preview deployment within timeout. Manual testing recommended.`
+            `⚠️ **Visual Verification Skipped**\n\nCould not detect Vercel preview deployment. The PR is ready for manual review.`
           );
         } else {
           console.log(`✅ Preview URL ready: ${previewUrl}`);
 
-          // Post update to Jira
-          await addJiraComment(
-            issueKey,
-            `🔍 **Starting Browser Tests**\n\nVercel preview deployed at: ${previewUrl}\n\nRunning automated visual verification...`
-          );
+          if (!generatedTestCode) {
+            console.log('⚠️ No test code was generated by Claude during implementation');
+            await addJiraComment(
+              issueKey,
+              `⚠️ **Visual Verification Skipped**\n\nClaude did not provide test code after implementation. Manual testing recommended.`
+            );
+          } else {
+            console.log('✓ Using test code generated during implementation');
+            console.log('📝 Test code length:', generatedTestCode.length, 'chars');
+            console.log('🎭 Running browser test...');
 
-          // Ask Claude to generate test code with codebase context
-          console.log('🤖 Asking Claude to generate test scenario...');
-          const testPrompt = `You have access to the full codebase via GitHub. Generate Playwright test code to verify the implementation works visually.
+            const testResult = await executeBrowserTest(previewUrl, generatedTestCode);
 
-**IMPORTANT - Use Codebase Context:**
-Before writing the test code, you should:
-1. Search the codebase for relevant components (e.g., if requirements mention "edit button", search for the component)
-2. Read the component files to find actual selectors (data-testid, aria-labels, classes, etc.)
-3. Use the REAL selectors from the code, not generic guesses
+            console.log(`📊 Test result: success=${testResult.success}, steps=${testResult.steps.length}, error=${testResult.error || 'none'}`);
 
-The code is in the GitHub repository: ${owner}/${repo} on branch ${branchName}
+            if (testResult.success && testResult.steps.length > 0) {
+              console.log('✅ Test executed successfully, captured', testResult.steps.length, 'screenshots');
+              // Visual review
+              const imageBlocks = testResult.steps.map(step => ({
+                type: 'image' as const,
+                source: { type: 'base64' as const, media_type: 'image/png' as const, data: step.screenshot }
+              }));
 
-**Requirements:**
-${description}
-
-**Your Task:**
-1. First, search/read the codebase to understand the component structure and find selectors
-2. Then, provide ONLY the Playwright test JavaScript code (no markdown, no explanations)
-
-**Preview URL (Base):** ${previewUrl}
-The browser will start at this URL (homepage).
-
-**CRITICAL - Path Handling:**
-- The page is already loaded at ${previewUrl} (may auto-redirect to include locale like /en/)
-- If requirements mention a path like "/en/recharge/mexico/products", you MUST construct the URL correctly
-- Get the page's origin (domain only): const origin = new URL(helpers.page.url()).origin;
-- Then navigate: await helpers.page.goto(origin + '/en/recharge/mexico/products');
-- This prevents doubling locale paths (e.g., /en/en/recharge...)
-
-**Navigation Strategy:**
-1. For specific paths in requirements:
-   - const origin = new URL(helpers.page.url()).origin;
-   - await helpers.page.goto(origin + '/the/path/from/requirements');
-   - await helpers.page.waitForLoadState('networkidle');
-2. For UI navigation, click links/buttons on the page
-3. NEVER use relative paths or hardcode the preview URL structure
-
-**What to test:**
-- Test the specific functionality described in the requirements
-- USE the selectors found in the Component Inspection Results above
-- Capture screenshots at key steps to visually verify behavior
-- Wait for elements to be ready before interacting (use waitForSelector)
-
-Provide ONLY the JavaScript code to execute (no markdown, no explanations). The code will be run with:
-- helpers.page (Playwright Page object) - already at ${previewUrl}
-- helpers.captureStep(description) (captures screenshot with description)
-
-Example structure (adapt based on inspection results):
-const origin = new URL(helpers.page.url()).origin;
-await helpers.page.goto(origin + '/en/recharge/mexico/products?msisdn=+123456');
-await helpers.page.waitForLoadState('networkidle');
-await helpers.captureStep('Products page loaded');
-await helpers.page.waitForSelector('THE_SELECTOR_FROM_INSPECTION');
-await helpers.page.click('THE_SELECTOR_FROM_INSPECTION');
-await helpers.page.waitForTimeout(500);
-await helpers.captureStep('Modal opened');
-
-Start your code immediately without any explanation.`;
-
-          // Create a mini agentic loop for test code generation with file access
-          const testGenMessages: Anthropic.MessageParam[] = [{
-            role: 'user',
-            content: testPrompt
-          }];
-
-          const searchAndReadTools = tools.filter(t =>
-            t.name === 'search_files' || t.name === 'read_file' || t.name === 'list_files'
-          );
-
-          let testCode = '';
-
-          // Mini agentic loop (max 5 turns for searching/reading)
-          for (let turn = 0; turn < 5; turn++) {
-            const testCodeResponse = await anthropic.messages.create({
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 4000,
-              tools: searchAndReadTools,
-              messages: testGenMessages
-            });
-
-            testGenMessages.push({
-              role: 'assistant',
-              content: testCodeResponse.content
-            });
-
-            // Extract text content
-            const textContent = testCodeResponse.content
-              .filter(block => block.type === 'text')
-              .map(block => (block as any).text)
-              .join('\n');
-
-            console.log(`  Turn ${turn + 1} text content (first 300 chars):`, textContent.substring(0, 300));
-
-            // Try to extract code - look for code blocks or direct code
-            if (textContent) {
-              // Remove markdown code blocks
-              let extractedCode = textContent
-                .replace(/```javascript\n?/g, '')
-                .replace(/```js\n?/g, '')
-                .replace(/```\n?/g, '')
-                .trim();
-
-              // If we see Playwright code, save it
-              if (extractedCode.includes('helpers.page') || extractedCode.includes('helpers.captureStep')) {
-                testCode = extractedCode;
-                console.log('  ✓ Found test code with helpers');
-              } else if (extractedCode.includes('await ') && extractedCode.includes('.goto')) {
-                // Sometimes it might not use helpers variable name
-                testCode = extractedCode;
-                console.log('  ✓ Found test code with goto');
-              }
-            }
-
-            // Check if done
-            if (testCodeResponse.stop_reason === 'end_turn') {
-              console.log(`  Stop reason: end_turn at turn ${turn + 1}`);
-              break;
-            }
-
-            // Process tool uses
-            const hasToolUses = testCodeResponse.content.some(block => block.type === 'tool_use');
-            if (!hasToolUses) break;
-
-            const toolResults: Anthropic.ToolResultBlockParam[] = [];
-
-            for (const block of testCodeResponse.content) {
-              if (block.type === 'tool_use') {
-                console.log(`  Test gen tool: ${block.name}`);
-
-                let result: any = null;
-
-                if (block.name === 'search_files') {
-                  const input = block.input as { query: string; file_extension?: string };
-                  try {
-                    const searchQuery = `${input.query}${input.file_extension ? ` extension:${input.file_extension}` : ''} repo:${owner}/${repo}`;
-                    const { data } = await octokit.search.code({
-                      q: searchQuery
-                    });
-                    result = {
-                      success: true,
-                      files: data.items.slice(0, 10).map(item => ({
-                        path: item.path,
-                        score: item.score
-                      }))
-                    };
-                  } catch (error: any) {
-                    result = { error: error.message };
-                  }
-                } else if (block.name === 'read_file') {
-                  const input = block.input as { path: string };
-                  try {
-                    const { data } = await octokit.repos.getContent({
-                      owner,
-                      repo,
-                      path: input.path,
-                      ref: branchName
-                    });
-                    if ('content' in data && typeof data.content === 'string') {
-                      const content = Buffer.from(data.content, 'base64').toString('utf-8');
-                      result = { success: true, path: input.path, content };
-                    } else {
-                      result = { error: 'Path is a directory' };
-                    }
-                  } catch (error: any) {
-                    result = { error: error.message };
-                  }
-                } else if (block.name === 'list_files') {
-                  const input = block.input as { path: string };
-                  try {
-                    const { data } = await octokit.repos.getContent({
-                      owner,
-                      repo,
-                      path: input.path || '',
-                      ref: branchName
-                    });
-                    if (Array.isArray(data)) {
-                      result = {
-                        success: true,
-                        files: data.map(item => ({
-                          name: item.name,
-                          type: item.type,
-                          path: item.path
-                        }))
-                      };
-                    } else {
-                      result = { error: 'Path is not a directory' };
-                    }
-                  } catch (error: any) {
-                    result = { error: error.message };
-                  }
-                }
-
-                toolResults.push({
-                  type: 'tool_result',
-                  tool_use_id: block.id,
-                  content: JSON.stringify(result)
-                });
-              }
-            }
-
-            if (toolResults.length > 0) {
-              testGenMessages.push({
-                role: 'user',
-                content: toolResults
+              console.log('👀 Requesting visual review from Claude...');
+              const reviewResponse = await anthropic.messages.create({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 1500,
+                messages: [{
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: `Does this implementation work correctly?\n\n**Requirements:** ${description}\n\n**Steps:** ${testResult.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n')}\n\nStart with APPROVED: or NEEDS_FIX: then explain.` },
+                    ...imageBlocks
+                  ]
+                }]
               });
-            }
-          }
 
-          if (!testCode) {
-            console.error('❌ Failed to generate test code');
-            console.error('Final messages:', JSON.stringify(testGenMessages, null, 2).substring(0, 1000));
+              const review = reviewResponse.content.filter(b => b.type === 'text').map(b => (b as any).text).join('\n');
+              console.log('📋 Review result:', review.substring(0, 100) + '...');
 
-            await addJiraComment(
-              issueKey,
-              `❌ **Browser Test Generation Failed**\n\nCould not generate test code after searching the codebase. This might mean:\n- The components mentioned in the requirements don't exist yet\n- The selectors couldn't be determined from the code\n\nSkipping browser tests for now.`
-            );
+              await addJiraComment(issueKey, `🔍 **Visual Verification**\n\n${review}`);
 
-            // Don't throw, just skip browser testing
-            console.log('Skipping browser tests due to code generation failure');
-            // Continue to post comment and complete
-            const prUrl = `https://github.com/${owner}/${repo}/pull/${createdPrNumber}`;
-            await addJiraComment(
-              issueKey,
-              `✅ **Implementation Complete** (Browser tests skipped)\n\nPull Request: ${prUrl}`
-            );
-            return;
-          }
-
-          console.log('📝 Generated test code:', testCode.substring(0, 200) + '...');
-
-          // Execute browser test
-          console.log('🎭 Executing browser test...');
-          const testResult = await executeBrowserTest(previewUrl, testCode);
-
-          if (!testResult.success && !testResult.steps.length) {
-            throw new Error(`Browser test failed: ${testResult.error}`);
-          }
-
-          console.log(`📸 Captured ${testResult.steps.length} test steps`);
-
-          // Have Claude review the screenshots
-          console.log('👀 Claude reviewing test results...');
-
-          const imageBlocks = testResult.steps.map(step => ({
-            type: 'image' as const,
-            source: {
-              type: 'base64' as const,
-              media_type: 'image/png' as const,
-              data: step.screenshot
-            }
-          }));
-
-          const reviewPrompt = `Review these browser test screenshots and determine if the implementation works correctly.
-
-**Original Requirements:**
-${description}
-
-**Test Steps Captured:**
-${testResult.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n')}
-
-**Your Task:**
-Analyze the screenshots and determine if the feature works as intended. Look for:
-1. Does the visual behavior match the requirements?
-2. Are there any errors or broken UI elements?
-3. Does the feature actually work (e.g., modal closes, button does something, etc.)?
-
-**Response Format:**
-If everything works: Start with "APPROVED:" followed by explanation
-If there are issues: Start with "NEEDS_REVISION:" followed by detailed explanation of what's wrong and how to fix it`;
-
-          const visualReview = await anthropic.messages.create({
-            model: 'claude-sonnet-4-20250514',
-            max_tokens: 2000,
-            messages: [{
-              role: 'user',
-              content: [
-                { type: 'text', text: reviewPrompt },
-                ...imageBlocks
-              ]
-            }]
-          });
-
-          const reviewText = visualReview.content
-            .filter(block => block.type === 'text')
-            .map(block => (block as any).text)
-            .join('\n');
-
-          console.log('📋 Visual review result:', reviewText.substring(0, 200) + '...');
-
-          // Check if revision is needed
-          if (reviewText.includes('NEEDS_REVISION')) {
-            console.log('🔄 Visual verification failed - requesting code revision...');
-
-            // Post review to Jira
-            await addJiraComment(
-              issueKey,
-              `❌ **Browser Test Failed**\n\n${reviewText}\n\n🔄 Requesting automated revision...`
-            );
-
-            // Ask Claude to revise the code
-            const revisionPrompt = `The browser tests show the implementation doesn't work correctly.
-
-**Review Feedback:**
-${reviewText}
-
-**Task:** Fix the code to address the visual issues. Provide the file paths and complete updated code for any files that need changes.
-
-Format:
-FILE: path/to/file.ext
-\`\`\`
-[complete updated code]
-\`\`\``;
-
-            const revisionResponse = await anthropic.messages.create({
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 8000,
-              messages: [{
-                role: 'user',
-                content: revisionPrompt
-              }]
-            });
-
-            const revisionText = revisionResponse.content
-              .filter(block => block.type === 'text')
-              .map(block => (block as any).text)
-              .join('\n');
-
-            // Parse revision changes
-            const filePattern = /FILE:\s*(.+?)\n```[\w]*\n([\s\S]+?)\n```/g;
-            let match;
-            const revisions: Array<{ path: string; content: string }> = [];
-
-            while ((match = filePattern.exec(revisionText)) !== null) {
-              revisions.push({
-                path: match[1].trim(),
-                content: match[2]
-              });
-            }
-
-            if (revisions.length > 0) {
-              console.log(`✏️ Applying ${revisions.length} file revision(s)...`);
-
-              // Apply revisions to the PR branch
-              for (const revision of revisions) {
-                try {
-                  // Get file SHA
-                  const { data: fileData } = await octokit.repos.getContent({
-                    owner,
-                    repo,
-                    path: revision.path,
-                    ref: branchName
-                  });
-
-                  if ('sha' in fileData) {
-                    await octokit.repos.createOrUpdateFileContents({
-                      owner,
-                      repo,
-                      path: revision.path,
-                      message: `AI revision based on browser test feedback\n\n${reviewText.substring(0, 200)}`,
-                      content: Buffer.from(revision.content).toString('base64'),
-                      branch: branchName,
-                      sha: fileData.sha
-                    });
-                    console.log(`✅ Updated ${revision.path}`);
-                  }
-                } catch (error) {
-                  console.error(`Failed to update ${revision.path}:`, error);
-                }
+              if (review.includes('APPROVED')) {
+                console.log('✅ Visual verification APPROVED');
+              } else {
+                console.log('⚠️ Visual verification found issues (not approved)');
               }
+            } else {
+              console.log('❌ Browser test failed or produced no screenshots');
+              console.log('   Error:', testResult.error || 'No error message');
+              console.log('   Steps captured:', testResult.steps.length);
 
-              // Post revision update to Jira
               await addJiraComment(
                 issueKey,
-                `🔄 **Revision Applied**\n\nUpdated ${revisions.length} file(s) based on browser test feedback. New deployment will be created automatically.`
+                `⚠️ **Browser Test Failed**\n\nThe automated browser test could not complete successfully.\n\n**Error:** ${testResult.error || 'Unknown error'}\n\n**Screenshots captured:** ${testResult.steps.length}\n\nManual verification recommended.`
               );
-
-              console.log('✅ Revisions applied successfully');
-            } else {
-              console.log('⚠️ Could not parse revision code from Claude response');
             }
-
-          } else {
-            console.log('✅ Browser tests passed!');
-
-            // Post success to Jira
-            await addJiraComment(
-              issueKey,
-              `✅ **Browser Tests Passed**\n\n${reviewText}\n\nThe implementation has been visually verified and works as expected!`
-            );
           }
         }
 
-      } catch (browserTestError) {
-        console.error('Browser testing error:', browserTestError);
-        await addJiraComment(
-          issueKey,
-          `⚠️ **Browser Testing Error**\n\nAn error occurred during automated browser testing:\n\n${browserTestError instanceof Error ? browserTestError.message : String(browserTestError)}\n\nManual verification recommended.`
-        );
+        console.log(`✅ Successfully completed ${issueKey}`);
+
+      } catch (error) {
+        console.error('Error in completion phase:', error);
       }
     }
 
