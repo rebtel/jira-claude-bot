@@ -63,8 +63,11 @@ export async function waitForVercelDeployment(
                 console.log(`   Status: ${mainProject.nextCommitStatus || 'unknown'}`);
                 console.log(`   Preview URL: ${mainProject.previewUrl || 'none'}`);
 
-                // Check if deployment is ready (not PENDING or BUILDING)
-                if (mainProject.nextCommitStatus === 'DEPLOYED' && mainProject.previewUrl) {
+                // Check if deployment is ready (DEPLOYED or READY, not PENDING or BUILDING)
+                const readyStatuses = ['DEPLOYED', 'READY'];
+                const status = mainProject.nextCommitStatus || '';
+
+                if (readyStatuses.includes(status) && mainProject.previewUrl) {
                   const previewUrl = mainProject.previewUrl.startsWith('http')
                     ? mainProject.previewUrl
                     : `https://${mainProject.previewUrl}`;
@@ -78,7 +81,7 @@ export async function waitForVercelDeployment(
 
                   return previewUrl;
                 } else {
-                  console.log(`⏳ Deployment status: ${mainProject.nextCommitStatus} (waiting for DEPLOYED)`);
+                  console.log(`⏳ Deployment status: ${status} (waiting for DEPLOYED or READY)`);
                 }
               } else {
                 console.log(`⚠️ Could not find main project for repo: ${repo}`);
