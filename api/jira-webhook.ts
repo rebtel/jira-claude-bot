@@ -8,6 +8,8 @@ import { getCodeDiff } from './lib/github-client.js';
 import { validateTicketContent } from './lib/ai-validator.js';
 import { reviewCodeChanges } from './lib/ai-reviewer.js';
 import { getAgentTools, getInitialPrompt } from './lib/agent-tools.js';
+import { waitForVercelDeployment } from './lib/vercel-client.js';
+import { executeBrowserTest, getTestCodeTemplate } from './lib/browser-tester.js';
 import type { ReviewResult } from './lib/types.js';
 
 /**
@@ -178,6 +180,7 @@ async function processIssueAsync(
     const filesRead = new Set<string>(); // Track which files have been read
     let reviewCompleted = false; // Track if code review has been done
     let lastReviewResult: ReviewResult | null = null; // Store last review result
+    let createdPrNumber: number | null = null; // Track created PR for browser testing
 
     // Agentic loop (increased limit to allow for codebase exploration)
     for (let i = 0; i < 25; i++) {
@@ -556,6 +559,7 @@ async function processIssueAsync(
                     head: branchName,
                     base: defaultBranch
                   });
+                  createdPrNumber = pr.number; // Store for browser testing
                   result = { success: true, pr_url: pr.html_url, pr_number: pr.number };
                   console.log(`✓ PR created: ${pr.html_url}`);
 
@@ -611,6 +615,246 @@ async function processIssueAsync(
           role: 'user',
           content: toolResults
         });
+      }
+    }
+
+    // === BROWSER TESTING PHASE ===
+    // Only run if a PR was created
+    if (createdPrNumber) {
+      console.log('\n=== 🌐 Starting Browser Testing Phase ===');
+
+      try {
+        // Wait for Vercel deployment
+        const previewUrl = await waitForVercelDeployment(octokit, owner, repo, createdPrNumber, 5);
+
+        if (!previewUrl) {
+          console.log('⚠️ Could not get Vercel preview URL, skipping browser tests');
+          await addJiraComment(
+            issueKey,
+            `⚠️ **Browser Testing Skipped**\n\nCould not detect Vercel preview deployment within timeout. Manual testing recommended.`
+          );
+        } else {
+          console.log(`✅ Preview URL ready: ${previewUrl}`);
+
+          // Post update to Jira
+          await addJiraComment(
+            issueKey,
+            `🔍 **Starting Browser Tests**\n\nVercel preview deployed at: ${previewUrl}\n\nRunning automated visual verification...`
+          );
+
+          // Ask Claude to generate test code
+          console.log('🤖 Asking Claude to generate test scenario...');
+          const testPrompt = `Based on the original requirements, generate Playwright test code to verify the implementation works visually.
+
+**Original Requirements:**
+${description}
+
+**What to test:**
+- Test the specific functionality described in the requirements
+- Capture screenshots at key steps to visually verify behavior
+- Be specific with selectors (you may need to inspect the page)
+
+${getTestCodeTemplate(description)}
+
+Provide ONLY the JavaScript code to execute (no markdown, no explanations). The code will be run with access to:
+- helpers.page (Playwright Page object)
+- helpers.captureStep(description) (captures screenshot with description)
+
+Example:
+await helpers.captureStep('Initial page load');
+await helpers.page.click('.modal-trigger');
+await helpers.page.waitForTimeout(500);
+await helpers.captureStep('Modal opened');
+await helpers.page.click('body', { position: { x: 10, y: 10 } });
+await helpers.captureStep('Clicked outside modal - should be closed');`;
+
+          const testCodeResponse = await anthropic.messages.create({
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 2000,
+            messages: [{
+              role: 'user',
+              content: testPrompt
+            }]
+          });
+
+          const testCode = testCodeResponse.content
+            .filter(block => block.type === 'text')
+            .map(block => (block as any).text)
+            .join('\n')
+            .replace(/```javascript\n?/g, '')
+            .replace(/```\n?/g, '')
+            .trim();
+
+          console.log('📝 Generated test code:', testCode.substring(0, 200) + '...');
+
+          // Execute browser test
+          console.log('🎭 Executing browser test...');
+          const testResult = await executeBrowserTest(previewUrl, testCode);
+
+          if (!testResult.success && !testResult.steps.length) {
+            throw new Error(`Browser test failed: ${testResult.error}`);
+          }
+
+          console.log(`📸 Captured ${testResult.steps.length} test steps`);
+
+          // Have Claude review the screenshots
+          console.log('👀 Claude reviewing test results...');
+
+          const imageBlocks = testResult.steps.map(step => ({
+            type: 'image' as const,
+            source: {
+              type: 'base64' as const,
+              media_type: 'image/png' as const,
+              data: step.screenshot
+            }
+          }));
+
+          const reviewPrompt = `Review these browser test screenshots and determine if the implementation works correctly.
+
+**Original Requirements:**
+${description}
+
+**Test Steps Captured:**
+${testResult.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n')}
+
+**Your Task:**
+Analyze the screenshots and determine if the feature works as intended. Look for:
+1. Does the visual behavior match the requirements?
+2. Are there any errors or broken UI elements?
+3. Does the feature actually work (e.g., modal closes, button does something, etc.)?
+
+**Response Format:**
+If everything works: Start with "APPROVED:" followed by explanation
+If there are issues: Start with "NEEDS_REVISION:" followed by detailed explanation of what's wrong and how to fix it`;
+
+          const visualReview = await anthropic.messages.create({
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 2000,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: reviewPrompt },
+                ...imageBlocks
+              ]
+            }]
+          });
+
+          const reviewText = visualReview.content
+            .filter(block => block.type === 'text')
+            .map(block => (block as any).text)
+            .join('\n');
+
+          console.log('📋 Visual review result:', reviewText.substring(0, 200) + '...');
+
+          // Check if revision is needed
+          if (reviewText.includes('NEEDS_REVISION')) {
+            console.log('🔄 Visual verification failed - requesting code revision...');
+
+            // Post review to Jira
+            await addJiraComment(
+              issueKey,
+              `❌ **Browser Test Failed**\n\n${reviewText}\n\n🔄 Requesting automated revision...`
+            );
+
+            // Ask Claude to revise the code
+            const revisionPrompt = `The browser tests show the implementation doesn't work correctly.
+
+**Review Feedback:**
+${reviewText}
+
+**Task:** Fix the code to address the visual issues. Provide the file paths and complete updated code for any files that need changes.
+
+Format:
+FILE: path/to/file.ext
+\`\`\`
+[complete updated code]
+\`\`\``;
+
+            const revisionResponse = await anthropic.messages.create({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 8000,
+              messages: [{
+                role: 'user',
+                content: revisionPrompt
+              }]
+            });
+
+            const revisionText = revisionResponse.content
+              .filter(block => block.type === 'text')
+              .map(block => (block as any).text)
+              .join('\n');
+
+            // Parse revision changes
+            const filePattern = /FILE:\s*(.+?)\n```[\w]*\n([\s\S]+?)\n```/g;
+            let match;
+            const revisions: Array<{ path: string; content: string }> = [];
+
+            while ((match = filePattern.exec(revisionText)) !== null) {
+              revisions.push({
+                path: match[1].trim(),
+                content: match[2]
+              });
+            }
+
+            if (revisions.length > 0) {
+              console.log(`✏️ Applying ${revisions.length} file revision(s)...`);
+
+              // Apply revisions to the PR branch
+              for (const revision of revisions) {
+                try {
+                  // Get file SHA
+                  const { data: fileData } = await octokit.repos.getContent({
+                    owner,
+                    repo,
+                    path: revision.path,
+                    ref: branchName
+                  });
+
+                  if ('sha' in fileData) {
+                    await octokit.repos.createOrUpdateFileContents({
+                      owner,
+                      repo,
+                      path: revision.path,
+                      message: `AI revision based on browser test feedback\n\n${reviewText.substring(0, 200)}`,
+                      content: Buffer.from(revision.content).toString('base64'),
+                      branch: branchName,
+                      sha: fileData.sha
+                    });
+                    console.log(`✅ Updated ${revision.path}`);
+                  }
+                } catch (error) {
+                  console.error(`Failed to update ${revision.path}:`, error);
+                }
+              }
+
+              // Post revision update to Jira
+              await addJiraComment(
+                issueKey,
+                `🔄 **Revision Applied**\n\nUpdated ${revisions.length} file(s) based on browser test feedback. New deployment will be created automatically.`
+              );
+
+              console.log('✅ Revisions applied successfully');
+            } else {
+              console.log('⚠️ Could not parse revision code from Claude response');
+            }
+
+          } else {
+            console.log('✅ Browser tests passed!');
+
+            // Post success to Jira
+            await addJiraComment(
+              issueKey,
+              `✅ **Browser Tests Passed**\n\n${reviewText}\n\nThe implementation has been visually verified and works as expected!`
+            );
+          }
+        }
+
+      } catch (browserTestError) {
+        console.error('Browser testing error:', browserTestError);
+        await addJiraComment(
+          issueKey,
+          `⚠️ **Browser Testing Error**\n\nAn error occurred during automated browser testing:\n\n${browserTestError instanceof Error ? browserTestError.message : String(browserTestError)}\n\nManual verification recommended.`
+        );
       }
     }
 
