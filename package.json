@@ -4,18 +4,11 @@
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
-    "deploy": "vercel --prod",
-    "test": "playwright test",
-    "test:ui": "playwright test --ui",
-    "test:browser": "node test-browser.mjs"
+    "deploy": "vercel --prod"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "latest",
     "@anthropic-ai/sdk": "^0.68.0",
-    "@octokit/rest": "^22.0.0",
-    "@sparticuz/chromium": "^131.0.0",
-    "dotenv": "^17.2.3",
-    "playwright-core": "^1.47.0"
+    "@octokit/rest": "^22.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

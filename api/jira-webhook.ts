@@ -8,8 +8,6 @@ import { getCodeDiff } from './lib/github-client.js';
 import { validateTicketContent } from './lib/ai-validator.js';
 import { reviewCodeChanges } from './lib/ai-reviewer.js';
 import { getAgentTools, getInitialPrompt } from './lib/agent-tools.js';
-import { waitForVercelDeployment } from './lib/vercel-client.js';
-import { executeBrowserTest } from './lib/browser-tester.js';
 import type { ReviewResult } from './lib/types.js';
 
 /**
@@ -179,8 +177,7 @@ async function processIssueAsync(
     const filesRead = new Set<string>(); // Track which files have been read
     let reviewCompleted = false; // Track if code review has been done
     let lastReviewResult: ReviewResult | null = null; // Store last review result
-    let createdPrNumber: number | null = null; // Track created PR for browser testing
-    let generatedTestCode: string | null = null; // Store test code from Claude
+    let createdPrNumber: number | null = null; // Track created PR
 
     // Agentic loop (increased limit to allow for codebase exploration)
     for (let i = 0; i < 25; i++) {
@@ -200,36 +197,6 @@ async function processIssueAsync(
         role: 'assistant',
         content: response.content
       });
-
-      // Capture test code if PR was just created
-      if (createdPrNumber && !generatedTestCode) {
-        console.log('🔍 Looking for test code in response...');
-        for (const block of response.content) {
-          if (block.type === 'text') {
-            const text = (block as any).text;
-            console.log(`  Checking text block (${text.length} chars, contains helpers.page: ${text.includes('helpers.page')})`);
-
-            // Look for inline test code with helpers API
-            if (text.includes('helpers.page') || text.includes('helpers.captureStep')) {
-              generatedTestCode = text.replace(/```(javascript|js)?\n?/g, '').replace(/```/g, '').trim();
-              console.log('✓ Captured test code from Claude (helpers API detected)');
-              if (generatedTestCode) {
-                console.log('  First 200 chars:', generatedTestCode.substring(0, Math.min(200, generatedTestCode.length)));
-              }
-              break;
-            }
-            // Fallback: check if it looks like code but in wrong format
-            else if (text.includes('await page.') || text.includes('test.describe')) {
-              console.log('⚠️ Detected Playwright code but in wrong format (has imports/test blocks)');
-              console.log('  This needs to be inline code using helpers.page, not full test files');
-            }
-          }
-        }
-        if (!generatedTestCode) {
-          console.log('⚠️ No test code found in response after PR creation');
-          console.log('  Expected inline code using helpers.page and helpers.captureStep');
-        }
-      }
 
       // Check if we're done
       if (response.stop_reason === 'end_turn') {
@@ -589,31 +556,13 @@ async function processIssueAsync(
                     head: branchName,
                     base: defaultBranch
                   });
-                  createdPrNumber = pr.number; // Store for browser testing
+                  createdPrNumber = pr.number;
                   result = {
                     success: true,
                     pr_url: pr.html_url,
-                    pr_number: pr.number,
-                    message: `PR created successfully. Now generate INLINE Playwright test code for visual verification.
-
-CRITICAL FORMAT REQUIREMENTS:
-- NO imports, NO test.describe blocks, NO test() functions
-- Just raw async code that will be executed directly
-- Use: helpers.page (Playwright page object)
-- Use: await helpers.captureStep('description') to take screenshots
-- Use the ACTUAL selectors you saw in the component files (data-testid, aria-labels, etc.)
-
-Example format:
-const origin = new URL(helpers.page.url()).origin;
-await helpers.page.goto(origin + '/en/products?msisdn=+123');
-await helpers.captureStep('Page loaded');
-await helpers.page.click('[data-testid="edit-button"]');
-await helpers.captureStep('Modal opened');
-
-Generate ONLY the inline code, no explanations:`
+                    pr_number: pr.number
                   };
                   console.log(`✓ PR created: ${pr.html_url}`);
-                  console.log('📝 Requesting test code generation from Claude...');
 
                   // Post success comment to Jira with PR link
                   try {
@@ -674,7 +623,6 @@ Generate ONLY the inline code, no explanations:`
     if (createdPrNumber) {
       console.log('\n=== ✅ Implementation Complete ===');
       console.log(`   PR Number: ${createdPrNumber}`);
-      console.log(`   Test code generated: ${!!generatedTestCode}`);
 
       try {
         const prUrl = `https://github.com/${owner}/${repo}/pull/${createdPrNumber}`;
@@ -684,84 +632,10 @@ Generate ONLY the inline code, no explanations:`
           `✅ **Implementation Complete**\n\n` +
           `Pull Request: [#${createdPrNumber}](${prUrl})\n\n` +
           `**Next Steps:**\n` +
-          `- Waiting for Vercel preview deployment\n` +
-          `- Will run automated visual verification\n` +
           `- Review the code changes in the PR\n` +
+          `- Test the changes in a preview deployment\n` +
           `- Merge when ready!`
         );
-
-        console.log('\n=== 🌐 Starting Visual Verification Phase ===');
-        // Wait for Vercel preview deployment
-        console.log('⏳ Waiting for Vercel preview deployment (max 5 min)...');
-        const previewUrl = await waitForVercelDeployment(octokit, owner, repo, createdPrNumber, 5);
-
-        if (!previewUrl) {
-          console.log('⚠️ Could not get Vercel preview URL within timeout');
-          await addJiraComment(
-            issueKey,
-            `⚠️ **Visual Verification Skipped**\n\nCould not detect Vercel preview deployment. The PR is ready for manual review.`
-          );
-        } else {
-          console.log(`✅ Preview URL ready: ${previewUrl}`);
-
-          if (!generatedTestCode) {
-            console.log('⚠️ No test code was generated by Claude during implementation');
-            await addJiraComment(
-              issueKey,
-              `⚠️ **Visual Verification Skipped**\n\nClaude did not provide test code after implementation. Manual testing recommended.`
-            );
-          } else {
-            console.log('✓ Using test code generated during implementation');
-            console.log('📝 Test code length:', generatedTestCode.length, 'chars');
-            console.log('🎭 Running browser test...');
-
-            const testResult = await executeBrowserTest(previewUrl, generatedTestCode);
-
-            console.log(`📊 Test result: success=${testResult.success}, steps=${testResult.steps.length}, error=${testResult.error || 'none'}`);
-
-            if (testResult.success && testResult.steps.length > 0) {
-              console.log('✅ Test executed successfully, captured', testResult.steps.length, 'screenshots');
-              // Visual review
-              const imageBlocks = testResult.steps.map(step => ({
-                type: 'image' as const,
-                source: { type: 'base64' as const, media_type: 'image/png' as const, data: step.screenshot }
-              }));
-
-              console.log('👀 Requesting visual review from Claude...');
-              const reviewResponse = await anthropic.messages.create({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 1500,
-                messages: [{
-                  role: 'user',
-                  content: [
-                    { type: 'text', text: `Does this implementation work correctly?\n\n**Requirements:** ${description}\n\n**Steps:** ${testResult.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n')}\n\nStart with APPROVED: or NEEDS_FIX: then explain.` },
-                    ...imageBlocks
-                  ]
-                }]
-              });
-
-              const review = reviewResponse.content.filter(b => b.type === 'text').map(b => (b as any).text).join('\n');
-              console.log('📋 Review result:', review.substring(0, 100) + '...');
-
-              await addJiraComment(issueKey, `🔍 **Visual Verification**\n\n${review}`);
-
-              if (review.includes('APPROVED')) {
-                console.log('✅ Visual verification APPROVED');
-              } else {
-                console.log('⚠️ Visual verification found issues (not approved)');
-              }
-            } else {
-              console.log('❌ Browser test failed or produced no screenshots');
-              console.log('   Error:', testResult.error || 'No error message');
-              console.log('   Steps captured:', testResult.steps.length);
-
-              await addJiraComment(
-                issueKey,
-                `⚠️ **Browser Test Failed**\n\nThe automated browser test could not complete successfully.\n\n**Error:** ${testResult.error || 'Unknown error'}\n\n**Screenshots captured:** ${testResult.steps.length}\n\nManual verification recommended.`
-              );
-            }
-          }
-        }
 
         console.log(`✅ Successfully completed ${issueKey}`);
 
